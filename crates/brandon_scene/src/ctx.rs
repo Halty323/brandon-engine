@@ -1,5 +1,5 @@
 use crate::{Node, NodeId, Scene, SceneError, SceneLibrary};
-use brandon_core::{Assets, Input, Time};
+use brandon_core::{Assets, Input, Random, Time};
 use glam::{Affine2, Vec2};
 
 /// What the window currently shows.
@@ -13,7 +13,10 @@ pub struct View {
 
 impl Default for View {
     fn default() -> Self {
-        View { size: Vec2::new(1280.0, 720.0), screen_from_world: Affine2::IDENTITY }
+        View {
+            size: Vec2::new(1280.0, 720.0),
+            screen_from_world: Affine2::IDENTITY,
+        }
     }
 }
 
@@ -32,6 +35,8 @@ pub struct Ctx<'a> {
     /// Keyboard and mouse.
     pub input: &'a Input,
     pub time: &'a Time,
+    /// Random numbers for gameplay.
+    pub random: &'a mut Random,
     pub assets: &'a Assets,
     pub library: &'a SceneLibrary,
     pub view: &'a View,
@@ -56,7 +61,10 @@ impl Ctx<'_> {
 
     /// Converts a window position in pixels to a world position.
     pub fn screen_to_world(&self, screen: Vec2) -> Vec2 {
-        self.view.screen_from_world.inverse().transform_point2(screen)
+        self.view
+            .screen_from_world
+            .inverse()
+            .transform_point2(screen)
     }
 
     /// Converts a world position to a window position in pixels.
@@ -118,10 +126,12 @@ impl Scene {
     /// Runs one frame of every behaviour, parents before their children.
     ///
     /// Nodes spawned during the update start running on the next frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         input: &Input,
         time: &Time,
+        random: &mut Random,
         assets: &Assets,
         library: &SceneLibrary,
         view: &View,
@@ -132,11 +142,24 @@ impl Scene {
             if !self.has_behaviours(id) {
                 continue;
             }
-            let Some(mut node) = self.take(id) else { continue };
+            let Some(mut node) = self.take(id) else {
+                continue;
+            };
             let count = node.behaviours.len();
             for index in 0..count {
-                let Some(mut behaviour) = node.behaviours[index].behaviour.take() else { continue };
-                let mut ctx = Ctx { scene: self, input, time, assets, library, view, requests };
+                let Some(mut behaviour) = node.behaviours[index].behaviour.take() else {
+                    continue;
+                };
+                let mut ctx = Ctx {
+                    scene: self,
+                    input,
+                    time,
+                    random,
+                    assets,
+                    library,
+                    view,
+                    requests,
+                };
                 if !node.behaviours[index].ready {
                     node.behaviours[index].ready = true;
                     behaviour.ready(&mut node, &mut ctx);

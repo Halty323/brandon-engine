@@ -13,7 +13,10 @@ pub struct NodeId {
 
 impl NodeId {
     /// The id of no node.
-    pub const NONE: NodeId = NodeId { index: u32::MAX, generation: 0 };
+    pub const NONE: NodeId = NodeId {
+        index: u32::MAX,
+        generation: 0,
+    };
 
     pub fn is_none(self) -> bool {
         self == Self::NONE
@@ -36,6 +39,8 @@ impl std::fmt::Debug for NodeId {
     }
 }
 
+// Nodes are stored inline on purpose: one allocation for the whole tree.
+#[allow(clippy::large_enum_variant)]
 enum Content {
     Free,
     Here(Node),
@@ -91,7 +96,10 @@ impl Scene {
     /// [`NodeId::NONE`] is returned.
     pub fn spawn_child(&mut self, parent: NodeId, node: Node) -> NodeId {
         if !self.contains(parent) {
-            log::warn!("spawn_child: the parent of `{}` no longer exists, so it was not added", node.name);
+            log::warn!(
+                "spawn_child: the parent of `{}` no longer exists, so it was not added",
+                node.name
+            );
             return NodeId::NONE;
         }
         self.insert(Some(parent), node)
@@ -128,7 +136,10 @@ impl Scene {
             }
         };
         let slot = &mut self.slots[index as usize];
-        let id = NodeId { index, generation: slot.generation };
+        let id = NodeId {
+            index,
+            generation: slot.generation,
+        };
         node.id = id;
         slot.content = Content::Here(node);
         slot.parent = parent;
@@ -244,7 +255,10 @@ impl Scene {
 
     /// The node with this id, mutably. See [`get`](Self::get).
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        let slot = self.slots.get_mut(id.index as usize).filter(|s| s.generation == id.generation)?;
+        let slot = self
+            .slots
+            .get_mut(id.index as usize)
+            .filter(|s| s.generation == id.generation)?;
         match &mut slot.content {
             Content::Here(node) => Some(node),
             _ => None,
@@ -279,7 +293,9 @@ impl Scene {
 
     /// The first node with this name, searching the whole tree.
     pub fn find(&self, name: &str) -> Option<NodeId> {
-        self.ids().into_iter().find(|id| self.get(*id).is_some_and(|n| n.name == name))
+        self.ids()
+            .into_iter()
+            .find(|id| self.get(*id).is_some_and(|n| n.name == name))
     }
 
     /// The first node with this name among the descendants of `ancestor`.
@@ -296,7 +312,9 @@ impl Scene {
 
     /// The first node that has a behaviour of type `T`.
     pub fn first_with<T: Behaviour>(&self) -> Option<NodeId> {
-        self.ids().into_iter().find(|id| self.get(*id).is_some_and(|n| n.has::<T>()))
+        self.ids()
+            .into_iter()
+            .find(|id| self.get(*id).is_some_and(|n| n.has::<T>()))
     }
 
     /// The behaviour of type `T` on a node.
@@ -325,15 +343,22 @@ impl Scene {
     /// The world transform of a node you hold, using its current local
     /// transform. Works for the node passed to a running behaviour.
     pub fn world_transform_of(&self, node: &Node) -> Affine2 {
-        let parent_world = self.parent(node.id).map(|p| self.world_transform(p)).unwrap_or(Affine2::IDENTITY);
+        let parent_world = self
+            .parent(node.id)
+            .map(|p| self.world_transform(p))
+            .unwrap_or(Affine2::IDENTITY);
         parent_world * node.transform.to_affine()
     }
 
     /// Recomputes every node's world transform. The engine does this before
     /// behaviours update and before drawing.
     pub fn refresh_transforms(&mut self) {
-        let mut stack: Vec<(NodeId, Affine2, i32, bool, bool)> =
-            self.roots.iter().rev().map(|id| (*id, Affine2::IDENTITY, 0, false, true)).collect();
+        let mut stack: Vec<(NodeId, Affine2, i32, bool, bool)> = self
+            .roots
+            .iter()
+            .rev()
+            .map(|id| (*id, Affine2::IDENTITY, 0, false, true))
+            .collect();
         while let Some((id, parent_world, parent_z, parent_overlay, parent_shown)) = stack.pop() {
             let slot = &mut self.slots[id.index as usize];
             if let Content::Here(node) = &slot.content {
@@ -343,7 +368,12 @@ impl Scene {
                 slot.shown = parent_shown && node.visible;
             }
             let (world, z, overlay, shown) = (slot.world, slot.z, slot.overlay, slot.shown);
-            stack.extend(slot.children.iter().rev().map(|c| (*c, world, z, overlay, shown)));
+            stack.extend(
+                slot.children
+                    .iter()
+                    .rev()
+                    .map(|c| (*c, world, z, overlay, shown)),
+            );
         }
     }
 
@@ -358,7 +388,14 @@ impl Scene {
                 continue;
             }
             if let Content::Here(node) = &slot.content {
-                f(node, Visible { world: slot.world, z: slot.z, overlay: slot.overlay });
+                f(
+                    node,
+                    Visible {
+                        world: slot.world,
+                        z: slot.z,
+                        overlay: slot.overlay,
+                    },
+                );
             }
             stack.extend(slot.children.iter().rev());
         }
@@ -383,7 +420,9 @@ impl Scene {
         };
         let (_, rotation, translation) = world.to_scale_angle_translation();
         let camera = Affine2::from_angle_translation(rotation, translation);
-        Affine2::from_translation(window_size * 0.5) * Affine2::from_scale(Vec2::splat(zoom.max(1e-6))) * camera.inverse()
+        Affine2::from_translation(window_size * 0.5)
+            * Affine2::from_scale(Vec2::splat(zoom.max(1e-6)))
+            * camera.inverse()
     }
 
     fn for_each_node(&self, mut f: impl FnMut(&Node, Affine2)) {
@@ -402,7 +441,10 @@ impl Scene {
     }
 
     pub(crate) fn take(&mut self, id: NodeId) -> Option<Node> {
-        let slot = self.slots.get_mut(id.index as usize).filter(|s| s.generation == id.generation)?;
+        let slot = self
+            .slots
+            .get_mut(id.index as usize)
+            .filter(|s| s.generation == id.generation)?;
         match std::mem::replace(&mut slot.content, Content::Taken) {
             Content::Here(node) => Some(node),
             other => {
@@ -416,7 +458,11 @@ impl Scene {
     /// in the meantime, it is dropped.
     pub(crate) fn put_back(&mut self, node: Node) {
         let id = node.id;
-        if let Some(slot) = self.slots.get_mut(id.index as usize).filter(|s| s.generation == id.generation) {
+        if let Some(slot) = self
+            .slots
+            .get_mut(id.index as usize)
+            .filter(|s| s.generation == id.generation)
+        {
             if matches!(slot.content, Content::Taken) {
                 slot.content = Content::Here(node);
             }

@@ -1,5 +1,21 @@
 [package]
 name = "brandon_render"
+description = "The Brandon 2D renderer, built on Vulkan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+brandon_core.workspace = true
+glam.workspace = true
+log.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true
+ash.workspace = true
+ash-window.workspace = true
+raw-window-handle.workspace = true
+gpu-allocator.workspace = true
+naga.workspace = true
+cosmic-text.workspace = true

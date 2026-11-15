@@ -1,0 +1,8 @@
+(
+    name: "Star",
+    sprite: (texture: "star.png"),
+    shape: Circle(radius: 18),
+    behaviours: {
+        "Falling": (speed: 190, spin: 1.5, kind: Star),
+    },
+)

@@ -121,7 +121,10 @@ impl Node {
 
     /// The attached behaviour of type `T`, if there is one.
     pub fn behaviour<T: Behaviour>(&self) -> Option<&T> {
-        self.behaviours.iter().filter_map(BehaviourSlot::get).find_map(|b| (b as &dyn Any).downcast_ref::<T>())
+        self.behaviours
+            .iter()
+            .filter_map(BehaviourSlot::get)
+            .find_map(|b| (b as &dyn Any).downcast_ref::<T>())
     }
 
     /// The attached behaviour of type `T`, if there is one.

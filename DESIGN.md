@@ -4,6 +4,8 @@ Brandon is a 2D game engine and editor written in Rust. The goal is a more polis
 
 This document records the core decisions. It is meant to be short and to change as we learn. Anything under **Open questions** is not decided yet.
 
+**Where we are:** steps 1 and 2 of the [roadmap](#roadmap) are done. The runtime core exists and runs a demo game. Things described here but not built yet are marked *(planned)*.
+
 ## What Brandon does better than Godot
 
 1. **One simple scene model.** Godot has hundreds of node types in deep inheritance chains (`Node → CanvasItem → Node2D → CollisionObject2D → PhysicsBody2D → CharacterBody2D`), and "nodes" and "scenes" are two overlapping ideas with instancing, inheritance and editable children layered on top. Brandon keeps the tree but has one building block and a short, flat list of features.
@@ -16,19 +18,20 @@ This document records the core decisions. It is meant to be short and to change 
 The user sees a tree. Under the hood, storage can be dense and cache-friendly, but that is an implementation detail.
 
 - **Node** is the only building block. Every node has a name, a transform (position, rotation, scale, z-order), a visibility flag and children. Nothing else.
-- **Parts** give a node its abilities. A node holds at most one of each part from a small, flat list: `Sprite`, `Text`, `Shape` (collision), `Body` (physics), `Camera`, `Light`, `Particles`, `TileMap`, `Sound`, and UI parts later. There is no inheritance. A physics character is one node with `Body` and `Shape`, not three nested nodes.
-- **Behaviours** are the user's own Rust structs, attached to nodes the same way as parts. A node can have several. Fields marked `#[export]` show up in the inspector.
+- **Parts** give a node its abilities. A node holds at most one of each part from a small, flat list. Built so far: `Sprite`, `Text`, `Camera`, `Shape` (overlap detection) and `Overlay` (draws the node and its children fixed to the window, for scores and menus). *(Planned)*: `Body` (physics), `Light`, `Particles`, `TileMap`, `Sound` and UI parts. There is no inheritance. A physics character is one node with `Body` and `Shape`, not three nested nodes.
+- **Behaviours** are the user's own Rust structs, attached to nodes the same way as parts. A node can have several. A behaviour marked `#[behaviour]` can be saved in scene files, and its fields are what the inspector will show.
 - **Scenes** are files holding a node tree. Placing one scene inside another creates a linked instance. You can override the instance's properties but not restructure its children. There are no inherited scenes and no "editable children".
-- **Typed references instead of strings.** A behaviour field like `target: NodeRef<Player>` is set by drag and drop in the editor and checked when the scene loads. Events are typed Rust values, not named signals. Looking a node up by path still works, but it is not the main way.
+- **Typed references instead of strings** *(planned)*. A behaviour field like `target: NodeRef<Player>` is set by drag and drop in the editor and checked when the scene loads. Events are typed Rust values, not named signals. Looking a node up by name works today, but it is not meant to be the main way.
+- **While a behaviour runs, it holds its own node.** `update` gets `node: &mut Node` for the node it is attached to and reaches everything else through `ctx.scene`. This is what lets a behaviour change its node and the rest of the scene in the same line without fighting the borrow checker.
 
 What a game looks like:
 
 ```rust
 use brandon::prelude::*;
 
-#[derive(Behaviour, Default)]
+#[behaviour]
+#[derive(Default)]
 struct Player {
-    #[export]
     speed: f32,
 }
 
@@ -40,28 +43,32 @@ impl Behaviour for Player {
 }
 
 fn main() {
-    brandon::run(
-        Game::new()
-            .register::<Player>()
-            .start_scene("scenes/main.scene"),
-    );
+    Game::new()
+        .register::<Player>()
+        .start_scene("scenes/main.scene")
+        .run();
 }
 ```
+
+Coordinates: `x` grows to the right and `y` grows downwards, like pixels on a screen and like Godot. One unit is one pixel at normal zoom. Without a camera, `(0, 0)` is the top-left corner of the window.
+
+Scene files are RON, written to be read and edited by hand: defaults are left out, colours are hex strings, and mistakes are reported with a line number and a hint (for example, an unknown behaviour name lists the registered ones).
 
 ## Language and hot reload
 
 - Rust is the only language for game code. There is no visual scripting and no embedded scripting language.
 - A game is a normal Cargo crate that depends on `brandon`.
-- In the editor, the game crate is built as a dynamic library and hot-reloaded: the editor saves the scene state, swaps the library and restores the state, so you keep your place while changing code. This needs the editor and game to be built with the same Rust compiler, which the editor will check.
+- *(Planned)* In the editor, the game crate is built as a dynamic library and hot-reloaded: the editor saves the scene state, swaps the library and restores the state, so you keep your place while changing code. This needs the editor and game to be built with the same Rust compiler, which the editor will check.
 - Shipped games link everything statically. There is no dynamic loading at runtime.
 - Code is edited in the user's own IDE (RustRover, VS Code, etc.). The editor opens files there and does not ship its own code editor.
 
 ## Graphics
 
 - **Vulkan underneath**, through `ash` with `gpu-allocator` for memory. Brandon owns its renderer, so there is no general-purpose graphics abstraction in between.
-- Target Vulkan 1.2 plus dynamic rendering and synchronization2, which keeps the code simpler and still runs on MoltenVK.
-- The renderer is 2D-first: batched sprites, an HDR render target, 2D lights with normal maps and soft shadows, post-processing (bloom, colour grading), particles and high-quality text.
-- Users can write custom shaders. They are compiled to SPIR-V with `naga` (pure Rust, so no C++ toolchain is needed).
+- Target Vulkan 1.2 plus the dynamic rendering extension, which keeps the code simpler and still runs on MoltenVK.
+- Built so far: sprites batched by texture, premultiplied alpha (no dark fringes on soft edges), an sRGB-correct pipeline, smooth or pixel-art scaling per sprite, and text from a glyph atlas that is rasterised at the size it appears on screen.
+- *(Planned)*: an HDR render target, 2D lights with normal maps and soft shadows, post-processing (bloom, colour grading) and particles.
+- Shaders are written in WGSL and compiled to SPIR-V with `naga` (pure Rust, so no C++ toolchain is needed). *(Planned)*: users can write their own.
 
 ## Platforms
 
@@ -87,8 +94,8 @@ Technology: the editor is a Rust app built on the same engine crates, so the vie
 | Windows and input | `winit` |
 | Vulkan | `ash`, `gpu-allocator` |
 | Maths | `glam` |
-| Physics | `rapier2d` |
-| Audio | `kira` |
+| Physics *(planned)* | `rapier2d` |
+| Audio *(planned)* | `kira` |
 | Text shaping | `cosmic-text` |
 | Scene files | `serde` + `ron` (readable and friendly to version control) |
 | Shaders | `naga` |
@@ -98,12 +105,15 @@ Technology: the editor is a Rust app built on the same engine crates, so the vie
 
 ```
 crates/
-  brandon/         the crate users depend on: prelude, run()
-  brandon_core/    app loop, time, input, assets
-  brandon_render/  Vulkan renderer
+  brandon/         the crate users depend on: Game, the game loop, the prelude
+  brandon_core/    maths, colour, time, input, random numbers, asset lookup
   brandon_scene/   nodes, parts, behaviours, scene files
-  brandon_editor/  the editor app
+  brandon_render/  Vulkan renderer and text
+  brandon_macros/  #[behaviour] and #[data]
+  brandon_editor/  the editor app (planned)
 examples/
+  hello/           the smallest game: a scene built in code
+  starfall/        a small complete game built from scene files
 ```
 
 ## Not in the first versions
@@ -112,8 +122,8 @@ examples/
 
 ## Roadmap
 
-1. **This document.**
-2. **Runtime core and a demo game.** Window, Vulkan sprite renderer, text, camera, input, asset loading and the scene model, shown working in a small playable demo.
+1. **This document.** Done.
+2. **Runtime core and a demo game.** Window, Vulkan sprite renderer, text, camera, input, asset loading and the scene model, shown working in a small playable demo. Done: see `examples/starfall`.
 3. **Editor foundation.** Scene tree, inspector, viewport with move, rotate and scale handles, saving and loading scenes, and hot reload of game code.
 4. **Visual polish and learning material.** Lights and shadows, custom shaders, particles, post-processing, a getting-started tutorial and examples.
 

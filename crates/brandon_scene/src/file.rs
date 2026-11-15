@@ -4,8 +4,10 @@ use brandon_core::{AssetError, Assets};
 use serde::de::{DeserializeSeed, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::sync::Arc;
 
 /// Something went wrong loading or saving a scene.
 #[derive(Debug, thiserror::Error)]
@@ -93,7 +95,9 @@ impl Clone for BehaviourList {
         BehaviourList(
             self.0
                 .iter()
-                .filter_map(|b| registry::entry_for(b.as_ref()).map(|entry| (entry.clone)(b.as_ref())))
+                .filter_map(|b| {
+                    registry::entry_for(b.as_ref()).map(|entry| (entry.clone)(b.as_ref()))
+                })
                 .collect(),
         )
     }
@@ -119,10 +123,14 @@ impl<'de> Deserialize<'de> for BehaviourList {
         impl<'de> DeserializeSeed<'de> for Seed {
             type Value = Box<dyn Behaviour>;
 
-            fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+            fn deserialize<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
                 let mut erased = <dyn erased_serde::Deserializer>::erase(deserializer);
-                (self.0.deserialize)(&mut erased)
-                    .map_err(|e| serde::de::Error::custom(format!("in behaviour `{}`: {e}", self.0.name)))
+                (self.0.deserialize)(&mut erased).map_err(|e| {
+                    serde::de::Error::custom(format!("in behaviour `{}`: {e}", self.0.name))
+                })
             }
         }
 
@@ -163,7 +171,10 @@ impl NodeData {
     fn parse(path: &str, text: &str) -> Result<NodeData, SceneError> {
         ron_options()
             .from_str::<NodeData>(text)
-            .map_err(|e| SceneError::Parse { path: path.to_string(), message: format!("line {}: {}", e.position, e.code) })
+            .map_err(|e| SceneError::Parse {
+                path: path.to_string(),
+                message: format!("line {}: {}", e.position, e.code),
+            })
     }
 
     /// Builds a node without loading the scene files it refers to.
@@ -199,8 +210,8 @@ impl Node {
 /// times reads the file only once.
 #[derive(Default)]
 pub struct SceneLibrary {
-    cache: Mutex<HashMap<String, Arc<NodeData>>>,
-    reported: Mutex<HashSet<String>>,
+    cache: RefCell<HashMap<String, Rc<NodeData>>>,
+    reported: RefCell<HashSet<String>>,
 }
 
 impl SceneLibrary {
@@ -210,8 +221,8 @@ impl SceneLibrary {
 
     /// Forgets every loaded file, so they are read again when next used.
     pub fn clear(&self) {
-        self.cache.lock().unwrap().clear();
-        self.reported.lock().unwrap().clear();
+        self.cache.borrow_mut().clear();
+        self.reported.borrow_mut().clear();
     }
 
     /// Loads a scene file as the scene being run or edited.
@@ -233,24 +244,31 @@ impl SceneLibrary {
     /// problem (once per file) and returns an empty stand-in node.
     pub fn instantiate_or_placeholder(&self, assets: &Assets, path: &str) -> Node {
         self.instantiate(assets, path).unwrap_or_else(|error| {
-            if self.reported.lock().unwrap().insert(path.to_string()) {
+            if self.reported.borrow_mut().insert(path.to_string()) {
                 log::error!("{error}");
             }
             Node::new(format!("<missing {path}>"))
         })
     }
 
-    fn data(&self, assets: &Assets, path: &str) -> Result<Arc<NodeData>, SceneError> {
-        if let Some(data) = self.cache.lock().unwrap().get(path) {
+    fn data(&self, assets: &Assets, path: &str) -> Result<Rc<NodeData>, SceneError> {
+        if let Some(data) = self.cache.borrow().get(path) {
             return Ok(data.clone());
         }
         let text = assets.read_text(path)?;
-        let data = Arc::new(NodeData::parse(path, &text)?);
-        self.cache.lock().unwrap().insert(path.to_string(), data.clone());
+        let data = Rc::new(NodeData::parse(path, &text)?);
+        self.cache
+            .borrow_mut()
+            .insert(path.to_string(), data.clone());
         Ok(data)
     }
 
-    fn build(&self, assets: &Assets, data: &NodeData, chain: &mut Vec<String>) -> Result<Node, SceneError> {
+    fn build(
+        &self,
+        assets: &Assets,
+        data: &NodeData,
+        chain: &mut Vec<String>,
+    ) -> Result<Node, SceneError> {
         let mut node = match &data.instance {
             None => {
                 let mut node = Node::new(data.name.clone());
@@ -261,7 +279,10 @@ impl SceneLibrary {
                 if chain.contains(path) {
                     let mut full = chain.clone();
                     full.push(path.clone());
-                    return Err(SceneError::Cycle { path: path.clone(), chain: full });
+                    return Err(SceneError::Cycle {
+                        path: path.clone(),
+                        chain: full,
+                    });
                 }
                 chain.push(path.clone());
                 let placed = self.data(assets, path)?;
@@ -296,7 +317,8 @@ impl SceneLibrary {
             node.push_behaviour(behaviour);
         }
         for child in &data.children {
-            node.pending_children.push(self.build(assets, child, chain)?);
+            node.pending_children
+                .push(self.build(assets, child, chain)?);
         }
         Ok(node)
     }
@@ -311,8 +333,12 @@ impl Scene {
     /// with a warning.
     pub fn to_ron(&self, id: NodeId) -> Result<String, SceneError> {
         let data = self.to_data(id, true).ok_or(SceneError::MissingNode)?;
-        let pretty = ron::ser::PrettyConfig::new().struct_names(false).indentor("    ".to_string());
-        ron_options().to_string_pretty(&data, pretty).map_err(|e| SceneError::Write(e.to_string()))
+        let pretty = ron::ser::PrettyConfig::new()
+            .struct_names(false)
+            .indentor("    ".to_string());
+        ron_options()
+            .to_string_pretty(&data, pretty)
+            .map_err(|e| SceneError::Write(e.to_string()))
     }
 
     fn to_data(&self, id: NodeId, is_root: bool) -> Option<NodeData> {
@@ -349,7 +375,11 @@ impl Scene {
             shape: node.shape,
             overlay: node.overlay,
             behaviours: BehaviourList(behaviours),
-            children: self.children(id).iter().filter_map(|c| self.to_data(*c, false)).collect(),
+            children: self
+                .children(id)
+                .iter()
+                .filter_map(|c| self.to_data(*c, false))
+                .collect(),
         })
     }
 }

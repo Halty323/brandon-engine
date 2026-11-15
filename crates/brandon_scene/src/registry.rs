@@ -5,7 +5,8 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
-type DeserializeFn = fn(&mut dyn erased_serde::Deserializer) -> Result<Box<dyn Behaviour>, erased_serde::Error>;
+type DeserializeFn =
+    fn(&mut dyn erased_serde::Deserializer) -> Result<Box<dyn Behaviour>, erased_serde::Error>;
 
 pub(crate) struct Entry {
     pub(crate) name: String,
@@ -32,7 +33,9 @@ fn deserialize_as<T: Behaviour + DeserializeOwned>(
 }
 
 fn downcast<T: Behaviour>(b: &dyn Behaviour) -> &T {
-    (b as &dyn Any).downcast_ref::<T>().expect("behaviour registry entry used with the wrong type")
+    (b as &dyn Any)
+        .downcast_ref::<T>()
+        .expect("behaviour registry entry used with the wrong type")
 }
 
 fn serialize_as<T: Behaviour + Serialize>(b: &dyn Behaviour) -> &dyn erased_serde::Serialize {
@@ -52,7 +55,13 @@ where
     T: Behaviour + Serialize + DeserializeOwned + Clone,
 {
     let full = std::any::type_name::<T>();
-    let short = full.split('<').next().unwrap_or(full).rsplit("::").next().unwrap_or(full);
+    let short = full
+        .split('<')
+        .next()
+        .unwrap_or(full)
+        .rsplit("::")
+        .next()
+        .unwrap_or(full);
     register_as::<T>(short);
 }
 
@@ -69,7 +78,11 @@ where
     });
     let mut reg = registry().write().unwrap();
     if let Some(existing) = reg.by_name.get(name) {
-        if !reg.by_type.get(&TypeId::of::<T>()).is_some_and(|e| Arc::ptr_eq(e, existing)) {
+        if !reg
+            .by_type
+            .get(&TypeId::of::<T>())
+            .is_some_and(|e| Arc::ptr_eq(e, existing))
+        {
             log::warn!("behaviour name `{name}` was already registered for another type and is now replaced");
         }
     }

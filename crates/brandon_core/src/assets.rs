@@ -4,9 +4,15 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, thiserror::Error)]
 pub enum AssetError {
     #[error("asset `{path}` was not found (looked in: {})", searched.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))]
-    NotFound { path: String, searched: Vec<PathBuf> },
+    NotFound {
+        path: String,
+        searched: Vec<PathBuf>,
+    },
     #[error("could not read `{path}`: {source}")]
-    Io { path: String, source: std::io::Error },
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("could not decode image `{path}`: {message}")]
     Image { path: String, message: String },
 }
@@ -44,7 +50,10 @@ impl Assets {
             if let Some(manifest) = std::env::var_os("CARGO_MANIFEST_DIR") {
                 roots.push(PathBuf::from(manifest).join(folder));
             }
-            if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+            if let Some(exe_dir) = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+            {
                 roots.push(exe_dir.join(folder));
             }
         }
@@ -54,7 +63,9 @@ impl Assets {
 
     /// Uses exactly this folder.
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { roots: vec![root.into()] }
+        Self {
+            roots: vec![root.into()],
+        }
     }
 
     /// The folders that are searched, in order.
@@ -72,28 +83,44 @@ impl Assets {
             .iter()
             .map(|root| root.join(path))
             .find(|candidate| candidate.is_file())
-            .ok_or_else(|| AssetError::NotFound { path: path.to_string(), searched: self.roots.clone() })
+            .ok_or_else(|| AssetError::NotFound {
+                path: path.to_string(),
+                searched: self.roots.clone(),
+            })
     }
 
     /// Reads a whole asset file.
     pub fn read(&self, path: &str) -> Result<Vec<u8>, AssetError> {
         let file = self.resolve(path)?;
-        std::fs::read(&file).map_err(|source| AssetError::Io { path: path.to_string(), source })
+        std::fs::read(&file).map_err(|source| AssetError::Io {
+            path: path.to_string(),
+            source,
+        })
     }
 
     /// Reads an asset file as text.
     pub fn read_text(&self, path: &str) -> Result<String, AssetError> {
         let file = self.resolve(path)?;
-        std::fs::read_to_string(&file).map_err(|source| AssetError::Io { path: path.to_string(), source })
+        std::fs::read_to_string(&file).map_err(|source| AssetError::Io {
+            path: path.to_string(),
+            source,
+        })
     }
 
     /// Reads and decodes an image (PNG or JPEG).
     pub fn load_image(&self, path: &str) -> Result<ImageData, AssetError> {
         let bytes = self.read(path)?;
         let decoded = image::load_from_memory(&bytes)
-            .map_err(|e| AssetError::Image { path: path.to_string(), message: e.to_string() })?
+            .map_err(|e| AssetError::Image {
+                path: path.to_string(),
+                message: e.to_string(),
+            })?
             .into_rgba8();
-        Ok(ImageData { width: decoded.width(), height: decoded.height(), rgba: decoded.into_raw() })
+        Ok(ImageData {
+            width: decoded.width(),
+            height: decoded.height(),
+            rgba: decoded.into_raw(),
+        })
     }
 }
 
@@ -105,6 +132,9 @@ mod tests {
     fn missing_asset_names_the_searched_folders() {
         let assets = Assets::at("/definitely/not/here");
         let err = assets.read("x.png").unwrap_err().to_string();
-        assert!(err.contains("x.png") && err.contains("/definitely/not/here"), "{err}");
+        assert!(
+            err.contains("x.png") && err.contains("/definitely/not/here"),
+            "{err}"
+        );
     }
 }

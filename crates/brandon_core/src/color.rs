@@ -71,8 +71,16 @@ impl Color {
         if !s.is_ascii() {
             return None;
         }
-        let byte = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok().map(|v| v as f32 / 255.0);
-        let nibble = |i: usize| u8::from_str_radix(&s[i..i + 1], 16).ok().map(|v| (v * 17) as f32 / 255.0);
+        let byte = |i: usize| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .ok()
+                .map(|v| v as f32 / 255.0)
+        };
+        let nibble = |i: usize| {
+            u8::from_str_radix(&s[i..i + 1], 16)
+                .ok()
+                .map(|v| (v * 17) as f32 / 255.0)
+        };
         match s.len() {
             3 => Some(Color::rgb(nibble(0)?, nibble(1)?, nibble(2)?)),
             6 => Some(Color::rgb(byte(0)?, byte(2)?, byte(4)?)),
@@ -87,7 +95,13 @@ impl Color {
         if q(self.a) == 255 {
             format!("#{:02x}{:02x}{:02x}", q(self.r), q(self.g), q(self.b))
         } else {
-            format!("#{:02x}{:02x}{:02x}{:02x}", q(self.r), q(self.g), q(self.b), q(self.a))
+            format!(
+                "#{:02x}{:02x}{:02x}{:02x}",
+                q(self.r),
+                q(self.g),
+                q(self.b),
+                q(self.a)
+            )
         }
     }
 
@@ -144,7 +158,11 @@ impl<'de> Deserialize<'de> for Color {
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Color, E> {
-                Color::parse(v).ok_or_else(|| E::custom(format!("`{v}` is not a colour, expected something like \"#ff8800\"")))
+                Color::parse(v).ok_or_else(|| {
+                    E::custom(format!(
+                        "`{v}` is not a colour, expected something like \"#ff8800\""
+                    ))
+                })
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Color, A::Error> {
@@ -174,7 +192,10 @@ mod tests {
         assert_eq!(c.to_hex_string(), "#ff8800");
         assert_eq!(Color::parse("#ff8800"), Some(c));
         assert_eq!(Color::parse("f80"), Some(c));
-        assert_eq!(Color::parse("#ff880080").unwrap().to_hex_string(), "#ff880080");
+        assert_eq!(
+            Color::parse("#ff880080").unwrap().to_hex_string(),
+            "#ff880080"
+        );
         assert_eq!(Color::parse("nope"), None);
         assert_eq!(Color::parse("#ffé"), None);
     }
@@ -185,9 +206,15 @@ mod tests {
         assert_eq!(c, Color::hex(0x336699));
         let c: Color = ron::from_str("(2.0, 0.5, 0.25, 1.0)").unwrap();
         assert_eq!(c, Color::rgba(2.0, 0.5, 0.25, 1.0));
-        assert_eq!(ron::to_string(&Color::hex(0x336699)).unwrap(), "\"#336699\"");
+        assert_eq!(
+            ron::to_string(&Color::hex(0x336699)).unwrap(),
+            "\"#336699\""
+        );
         let bright = ron::to_string(&Color::rgb(2.0, 0.5, 0.25)).unwrap();
-        assert_eq!(ron::from_str::<Color>(&bright).unwrap(), Color::rgb(2.0, 0.5, 0.25));
+        assert_eq!(
+            ron::from_str::<Color>(&bright).unwrap(),
+            Color::rgb(2.0, 0.5, 0.25)
+        );
     }
 
     #[test]

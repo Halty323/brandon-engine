@@ -36,7 +36,11 @@ pub(crate) struct BehaviourSlot {
 
 impl BehaviourSlot {
     pub(crate) fn new(behaviour: Box<dyn Behaviour>) -> Self {
-        BehaviourSlot { behaviour: Some(behaviour), ready: false, removed: false }
+        BehaviourSlot {
+            behaviour: Some(behaviour),
+            ready: false,
+            removed: false,
+        }
     }
 
     pub(crate) fn get(&self) -> Option<&dyn Behaviour> {

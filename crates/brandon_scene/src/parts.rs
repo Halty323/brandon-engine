@@ -51,12 +51,19 @@ impl Sprite {
 
     /// A sprite showing an image.
     pub fn new(texture: impl Into<String>) -> Self {
-        Sprite { texture: Some(texture.into()), ..Default::default() }
+        Sprite {
+            texture: Some(texture.into()),
+            ..Default::default()
+        }
     }
 
     /// A plain coloured rectangle.
     pub fn rect(width: f32, height: f32, color: Color) -> Self {
-        Sprite { size: Some(Vec2::new(width, height)), color, ..Default::default() }
+        Sprite {
+            size: Some(Vec2::new(width, height)),
+            color,
+            ..Default::default()
+        }
     }
 
     pub fn with_color(mut self, color: Color) -> Self {
@@ -132,7 +139,10 @@ pub struct Text {
 
 impl Text {
     pub fn new(text: impl Into<String>) -> Self {
-        Text { text: text.into(), ..Default::default() }
+        Text {
+            text: text.into(),
+            ..Default::default()
+        }
     }
 
     pub fn with_size(mut self, size: f32) -> Self {
@@ -153,7 +163,12 @@ impl Text {
 
 impl Default for Text {
     fn default() -> Self {
-        Text { text: String::new(), size: 24.0, color: Color::WHITE, align: Align::Left }
+        Text {
+            text: String::new(),
+            size: 24.0,
+            color: Color::WHITE,
+            align: Align::Left,
+        }
     }
 }
 
@@ -184,7 +199,10 @@ impl Camera {
 
 impl Default for Camera {
     fn default() -> Self {
-        Camera { zoom: 1.0, active: true }
+        Camera {
+            zoom: 1.0,
+            active: true,
+        }
     }
 }
 
@@ -199,7 +217,9 @@ pub enum Shape {
 
 impl Shape {
     pub fn rect(width: f32, height: f32) -> Self {
-        Shape::Rect { size: Vec2::new(width, height) }
+        Shape::Rect {
+            size: Vec2::new(width, height),
+        }
     }
 
     pub fn circle(radius: f32) -> Self {

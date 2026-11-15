@@ -14,6 +14,7 @@ brandon = { path = "crates/brandon" }
 brandon_core = { path = "crates/brandon_core" }
 brandon_scene = { path = "crates/brandon_scene" }
 brandon_render = { path = "crates/brandon_render" }
+brandon_macros = { path = "crates/brandon_macros" }
 
 glam = { version = "0.30", features = ["serde", "bytemuck"] }
 serde = { version = "1", features = ["derive"] }

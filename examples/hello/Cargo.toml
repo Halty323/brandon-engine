@@ -1,0 +1,10 @@
+[package]
+name = "hello"
+description = "The smallest Brandon game: a scene built in code, with a camera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+brandon.workspace = true

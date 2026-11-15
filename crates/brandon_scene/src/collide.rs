@@ -3,7 +3,10 @@ use glam::{Affine2, Vec2};
 
 /// A shape placed in the world.
 enum Placed {
-    Circle { center: Vec2, radius: f32 },
+    Circle {
+        center: Vec2,
+        radius: f32,
+    },
     /// A convex quad: a rectangle after rotation and scaling.
     Quad([Vec2; 4]),
 }
@@ -11,8 +14,15 @@ enum Placed {
 fn place(shape: &Shape, world: &Affine2) -> Placed {
     match *shape {
         Shape::Circle { radius } => {
-            let scale = world.matrix2.x_axis.length().max(world.matrix2.y_axis.length());
-            Placed::Circle { center: world.translation, radius: radius * scale }
+            let scale = world
+                .matrix2
+                .x_axis
+                .length()
+                .max(world.matrix2.y_axis.length());
+            Placed::Circle {
+                center: world.translation,
+                radius: radius * scale,
+            }
         }
         Shape::Rect { size } => {
             let h = size * 0.5;
@@ -27,10 +37,12 @@ fn place(shape: &Shape, world: &Affine2) -> Placed {
 }
 
 fn project(points: &[Vec2; 4], axis: Vec2) -> (f32, f32) {
-    points.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| {
-        let d = p.dot(axis);
-        (lo.min(d), hi.max(d))
-    })
+    points
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| {
+            let d = p.dot(axis);
+            (lo.min(d), hi.max(d))
+        })
 }
 
 fn quads_overlap(a: &[Vec2; 4], b: &[Vec2; 4]) -> bool {
@@ -67,20 +79,33 @@ fn point_in_quad(point: Vec2, quad: &[Vec2; 4]) -> bool {
 fn distance_to_segment(point: Vec2, a: Vec2, b: Vec2) -> f32 {
     let ab = b - a;
     let len2 = ab.length_squared();
-    let t = if len2 > 0.0 { ((point - a).dot(ab) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    let t = if len2 > 0.0 {
+        ((point - a).dot(ab) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     point.distance(a + ab * t)
 }
 
 fn circle_quad_overlap(center: Vec2, radius: f32, quad: &[Vec2; 4]) -> bool {
-    point_in_quad(center, quad) || (0..4).any(|i| distance_to_segment(center, quad[i], quad[(i + 1) % 4]) <= radius)
+    point_in_quad(center, quad)
+        || (0..4).any(|i| distance_to_segment(center, quad[i], quad[(i + 1) % 4]) <= radius)
 }
 
 fn overlap(a: &Placed, b: &Placed) -> bool {
     match (a, b) {
-        (Placed::Circle { center: c1, radius: r1 }, Placed::Circle { center: c2, radius: r2 }) => {
-            c1.distance_squared(*c2) <= (r1 + r2) * (r1 + r2)
-        }
-        (Placed::Circle { center, radius }, Placed::Quad(q)) | (Placed::Quad(q), Placed::Circle { center, radius }) => {
+        (
+            Placed::Circle {
+                center: c1,
+                radius: r1,
+            },
+            Placed::Circle {
+                center: c2,
+                radius: r2,
+            },
+        ) => c1.distance_squared(*c2) <= (r1 + r2) * (r1 + r2),
+        (Placed::Circle { center, radius }, Placed::Quad(q))
+        | (Placed::Quad(q), Placed::Circle { center, radius }) => {
             circle_quad_overlap(*center, *radius, q)
         }
         (Placed::Quad(a), Placed::Quad(b)) => quads_overlap(a, b),
@@ -101,7 +126,9 @@ impl Scene {
     /// they were at the start of the frame. Returns nothing if `node` has no
     /// shape.
     pub fn overlapping(&self, node: &Node) -> Vec<NodeId> {
-        let Some(shape) = &node.shape else { return Vec::new() };
+        let Some(shape) = &node.shape else {
+            return Vec::new();
+        };
         let mine = place(shape, &self.world_transform_of(node));
         let mut hits = Vec::new();
         for id in self.ids() {
@@ -109,7 +136,9 @@ impl Scene {
                 continue;
             }
             let Some(other) = self.get(id) else { continue };
-            let Some(other_shape) = &other.shape else { continue };
+            let Some(other_shape) = &other.shape else {
+                continue;
+            };
             if overlap(&mine, &place(other_shape, &self.world_transform(id))) {
                 hits.push(id);
             }
@@ -125,7 +154,9 @@ impl Scene {
             .filter(|id| {
                 self.get(*id)
                     .and_then(|n| n.shape.as_ref())
-                    .is_some_and(|shape| contains_point(&place(shape, &self.world_transform(*id)), point))
+                    .is_some_and(|shape| {
+                        contains_point(&place(shape, &self.world_transform(*id)), point)
+                    })
             })
             .collect()
     }
@@ -136,20 +167,41 @@ mod tests {
     use super::*;
 
     fn names(scene: &Scene, ids: Vec<NodeId>) -> Vec<String> {
-        ids.into_iter().map(|id| scene.get(id).unwrap().name.clone()).collect()
+        ids.into_iter()
+            .map(|id| scene.get(id).unwrap().name.clone())
+            .collect()
     }
 
     #[test]
     fn circles_and_rects() {
         let mut scene = Scene::new();
         let a = scene.spawn(Node::new("a").with(Shape::circle(10.0)));
-        scene.spawn(Node::new("touching circle").at(18.0, 0.0).with(Shape::circle(10.0)));
-        scene.spawn(Node::new("far circle").at(30.0, 0.0).with(Shape::circle(10.0)));
-        scene.spawn(Node::new("rect").at(0.0, 14.0).with(Shape::rect(100.0, 10.0)));
-        scene.spawn(Node::new("far rect").at(0.0, 30.0).with(Shape::rect(100.0, 10.0)));
+        scene.spawn(
+            Node::new("touching circle")
+                .at(18.0, 0.0)
+                .with(Shape::circle(10.0)),
+        );
+        scene.spawn(
+            Node::new("far circle")
+                .at(30.0, 0.0)
+                .with(Shape::circle(10.0)),
+        );
+        scene.spawn(
+            Node::new("rect")
+                .at(0.0, 14.0)
+                .with(Shape::rect(100.0, 10.0)),
+        );
+        scene.spawn(
+            Node::new("far rect")
+                .at(0.0, 30.0)
+                .with(Shape::rect(100.0, 10.0)),
+        );
         scene.spawn(Node::new("no shape").at(0.0, 0.0));
         let node = scene.get(a).unwrap();
-        assert_eq!(names(&scene, scene.overlapping(node)), ["touching circle", "rect"]);
+        assert_eq!(
+            names(&scene, scene.overlapping(node)),
+            ["touching circle", "rect"]
+        );
     }
 
     #[test]

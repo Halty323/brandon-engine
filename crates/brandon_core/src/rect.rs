@@ -28,6 +28,9 @@ impl Rect {
     }
 
     pub fn contains(self, point: Vec2) -> bool {
-        point.x >= self.x && point.x <= self.x + self.w && point.y >= self.y && point.y <= self.y + self.h
+        point.x >= self.x
+            && point.x <= self.x + self.w
+            && point.y >= self.y
+            && point.y <= self.y + self.h
     }
 }

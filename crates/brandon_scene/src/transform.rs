@@ -34,11 +34,19 @@ fn is_zero_i32(v: &i32) -> bool {
 }
 
 impl Transform {
-    pub const IDENTITY: Transform = Transform { position: Vec2::ZERO, rotation: 0.0, scale: Vec2::ONE, z: 0 };
+    pub const IDENTITY: Transform = Transform {
+        position: Vec2::ZERO,
+        rotation: 0.0,
+        scale: Vec2::ONE,
+        z: 0,
+    };
 
     /// A transform at a position.
     pub fn at(x: f32, y: f32) -> Self {
-        Transform { position: Vec2::new(x, y), ..Self::IDENTITY }
+        Transform {
+            position: Vec2::new(x, y),
+            ..Self::IDENTITY
+        }
     }
 
     /// The transform as a matrix.
@@ -77,9 +85,15 @@ mod tests {
         let t = Transform::IDENTITY;
         assert!(t.right().abs_diff_eq(Vec2::X, 1e-6));
         assert!(t.up().abs_diff_eq(Vec2::NEG_Y, 1e-6));
-        let quarter = Transform { rotation: std::f32::consts::FRAC_PI_2, ..Transform::IDENTITY };
+        let quarter = Transform {
+            rotation: std::f32::consts::FRAC_PI_2,
+            ..Transform::IDENTITY
+        };
         // A clockwise quarter turn makes "right" point down the screen.
         assert!(quarter.right().abs_diff_eq(Vec2::Y, 1e-6));
-        assert!(quarter.to_affine().transform_vector2(Vec2::X).abs_diff_eq(Vec2::Y, 1e-6));
+        assert!(quarter
+            .to_affine()
+            .transform_vector2(Vec2::X)
+            .abs_diff_eq(Vec2::Y, 1e-6));
     }
 }
