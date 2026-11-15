@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// The font built into the engine: Inter Medium, under the SIL Open Font License.
-const DEFAULT_FONT: &[u8] = include_bytes!("../assets/Inter-Medium.otf");
+pub const DEFAULT_FONT: &[u8] = include_bytes!("../assets/Inter-Medium.otf");
 
 const ATLAS_WIDTH: u32 = 1024;
 const ATLAS_START_HEIGHT: u32 = 512;

@@ -1,5 +1,5 @@
-use crate::shader::{compile_wgsl, QUAD_WGSL};
-use crate::{Filter, Frame, RenderError};
+use crate::shader::{compile_wgsl, MESH_WGSL, QUAD_WGSL};
+use crate::{Filter, Frame, MeshVertex, RenderError};
 use ash::{ext, khr, vk};
 use brandon_core::ImageData;
 use glam::{Mat4, Vec3};
@@ -59,6 +59,8 @@ struct GpuTexture {
     set: vk::DescriptorSet,
     width: u32,
     height: u32,
+    /// Is the data given to this texture already premultiplied by alpha?
+    premultiplied: bool,
 }
 
 struct GpuBuffer {
@@ -83,6 +85,26 @@ struct FrameSlot {
     image_available: vk::Semaphore,
     instances: Option<GpuBuffer>,
     capacity: usize,
+    mesh_vertices: GrowBuffer,
+    mesh_indices: GrowBuffer,
+}
+
+/// A buffer that is replaced by a bigger one when it gets too small.
+#[derive(Default)]
+struct GrowBuffer {
+    buffer: Option<GpuBuffer>,
+    /// Size in bytes.
+    capacity: usize,
+}
+
+/// One UI mesh, ready to draw.
+struct MeshDraw {
+    texture: u32,
+    filter: Filter,
+    first_index: u32,
+    index_count: u32,
+    vertex_offset: i32,
+    scissor: vk::Rect2D,
 }
 
 /// One quad as the shader sees it.
@@ -128,6 +150,7 @@ pub struct Renderer {
     texture_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    mesh_pipeline: vk::Pipeline,
     samplers: [vk::Sampler; 2],
     sampler_sets: [vk::DescriptorSet; 2],
     descriptor_pools: Vec<vk::DescriptorPool>,
@@ -338,6 +361,8 @@ impl Renderer {
                         .map_err(vk_err("creating a semaphore"))?,
                     instances: None,
                     capacity: 0,
+                    mesh_vertices: GrowBuffer::default(),
+                    mesh_indices: GrowBuffer::default(),
                 });
             }
 
@@ -404,7 +429,8 @@ impl Renderer {
                 (width, height),
                 vk::SwapchainKHR::null(),
             )?;
-            let pipeline = create_pipeline(&device, pipeline_layout, swapchain.format)?;
+            let pipeline = create_quad_pipeline(&device, pipeline_layout, swapchain.format)?;
+            let mesh_pipeline = create_mesh_pipeline(&device, pipeline_layout, swapchain.format)?;
 
             let mut renderer = Renderer {
                 entry,
@@ -426,6 +452,7 @@ impl Renderer {
                 texture_layout,
                 pipeline_layout,
                 pipeline,
+                mesh_pipeline,
                 samplers,
                 sampler_sets: [vk::DescriptorSet::null(); 2],
                 descriptor_pools: Vec::new(),
@@ -501,6 +528,28 @@ impl Renderer {
         height: u32,
         rgba: &[u8],
     ) -> Result<Texture, RenderError> {
+        self.create_texture_inner(width, height, rgba, false)
+    }
+
+    /// Uploads an image whose colours are already multiplied by alpha, as UI
+    /// toolkits provide them. Updates to this texture must be premultiplied
+    /// too.
+    pub fn create_premultiplied_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<Texture, RenderError> {
+        self.create_texture_inner(width, height, rgba, true)
+    }
+
+    fn create_texture_inner(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        premultiplied: bool,
+    ) -> Result<Texture, RenderError> {
         assert_eq!(
             rgba.len(),
             (width * height * 4) as usize,
@@ -572,6 +621,7 @@ impl Renderer {
                 set,
                 width,
                 height,
+                premultiplied,
             };
             self.upload(&texture, rgba, vk::ImageLayout::UNDEFINED)?;
             let index = match self.textures.iter().position(Option::is_none) {
@@ -658,7 +708,11 @@ impl Renderer {
             .allocation
             .mapped_slice_mut()
             .expect("upload buffers are mapped");
-        premultiply_into(rgba, &mut mapped[..rgba.len()]);
+        if texture.premultiplied {
+            mapped[..rgba.len()].copy_from_slice(rgba);
+        } else {
+            premultiply_into(rgba, &mut mapped[..rgba.len()]);
+        }
 
         let cmd = self
             .device
@@ -891,8 +945,11 @@ impl Renderer {
         self.swapchain = created?;
         if self.swapchain.format != old_format && self.swapchain.format != vk::Format::UNDEFINED {
             self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_pipeline(self.mesh_pipeline, None);
             self.pipeline =
-                create_pipeline(&self.device, self.pipeline_layout, self.swapchain.format)?;
+                create_quad_pipeline(&self.device, self.pipeline_layout, self.swapchain.format)?;
+            self.mesh_pipeline =
+                create_mesh_pipeline(&self.device, self.pipeline_layout, self.swapchain.format)?;
         }
         self.needs_recreate = false;
         Ok(())
@@ -959,6 +1016,26 @@ impl Renderer {
                     .copy_from_slice(bytes);
             }
 
+            let (mesh_vertices, mesh_indices, meshes) = self.build_meshes(frame);
+            let mut grow = std::mem::take(&mut self.frames[slot].mesh_vertices);
+            let filled = self.fill(
+                &mut grow,
+                bytemuck::cast_slice(&mesh_vertices),
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                "ui vertices",
+            );
+            self.frames[slot].mesh_vertices = grow;
+            filled?;
+            let mut grow = std::mem::take(&mut self.frames[slot].mesh_indices);
+            let filled = self.fill(
+                &mut grow,
+                bytemuck::cast_slice(&mesh_indices),
+                vk::BufferUsageFlags::INDEX_BUFFER,
+                "ui indices",
+            );
+            self.frames[slot].mesh_indices = grow;
+            filled?;
+
             let capture = self.capture_requested && self.swapchain.can_capture;
             if self.capture_requested && !self.swapchain.can_capture {
                 log::warn!("this window surface does not allow reading back frames, so no capture was taken");
@@ -982,6 +1059,7 @@ impl Renderer {
                 cmd,
                 frame,
                 &layers,
+                &meshes,
                 slot,
                 image_index,
                 capture_buffer.as_ref().map(|b| b.buffer),
@@ -1048,6 +1126,93 @@ impl Renderer {
         }
     }
 
+    /// Copies `bytes` into a per-frame buffer, replacing the buffer with a
+    /// bigger one first if needed.
+    unsafe fn fill(
+        &mut self,
+        grow: &mut GrowBuffer,
+        bytes: &[u8],
+        usage: vk::BufferUsageFlags,
+        name: &str,
+    ) -> Result<(), RenderError> {
+        if bytes.len() > grow.capacity {
+            if let Some(old) = grow.buffer.take() {
+                self.destroy_buffer(old);
+            }
+            grow.capacity = 0;
+            let capacity = bytes.len().next_power_of_two().max(1 << 16);
+            grow.buffer =
+                Some(self.create_buffer(capacity as u64, usage, MemoryLocation::CpuToGpu, name)?);
+            grow.capacity = capacity;
+        }
+        if let Some(buffer) = &mut grow.buffer {
+            buffer
+                .allocation
+                .mapped_slice_mut()
+                .expect("per-frame buffers are mapped")[..bytes.len()]
+                .copy_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    /// Joins the frame's UI meshes into one vertex and one index list, and
+    /// works out each mesh's clip rectangle in pixels.
+    fn build_meshes(&self, frame: &Frame) -> (Vec<MeshVertex>, Vec<u32>, Vec<MeshDraw>) {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut draws = Vec::new();
+        let extent = self.swapchain.extent;
+        let size = frame.size.max(glam::Vec2::ONE);
+        let pixels = glam::Vec2::new(extent.width as f32, extent.height as f32) / size;
+        for mesh in &frame.ui {
+            let live = self
+                .textures
+                .get(mesh.texture.index as usize)
+                .is_some_and(Option::is_some);
+            if !live || mesh.indices.is_empty() {
+                continue;
+            }
+            let scissor = match mesh.clip {
+                None => vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent,
+                },
+                Some([x, y, w, h]) => {
+                    let left = ((x * pixels.x).round() as i64).clamp(0, extent.width as i64);
+                    let top = ((y * pixels.y).round() as i64).clamp(0, extent.height as i64);
+                    let right =
+                        (((x + w) * pixels.x).round() as i64).clamp(left, extent.width as i64);
+                    let bottom =
+                        (((y + h) * pixels.y).round() as i64).clamp(top, extent.height as i64);
+                    vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: left as i32,
+                            y: top as i32,
+                        },
+                        extent: vk::Extent2D {
+                            width: (right - left) as u32,
+                            height: (bottom - top) as u32,
+                        },
+                    }
+                }
+            };
+            if scissor.extent.width == 0 || scissor.extent.height == 0 {
+                continue;
+            }
+            draws.push(MeshDraw {
+                texture: mesh.texture.index,
+                filter: mesh.filter,
+                first_index: indices.len() as u32,
+                index_count: mesh.indices.len() as u32,
+                vertex_offset: vertices.len() as i32,
+                scissor,
+            });
+            vertices.extend_from_slice(&mesh.vertices);
+            indices.extend_from_slice(&mesh.indices);
+        }
+        (vertices, indices, draws)
+    }
+
     /// Turns the frame's quads into instance data and batches. Quads are
     /// sorted by `z` (keeping their order otherwise), then runs of quads
     /// with the same texture become one draw.
@@ -1055,10 +1220,7 @@ impl Renderer {
         let total: usize = frame.layers.iter().map(|l| l.quads.len()).sum();
         let mut instances = Vec::with_capacity(total);
         let mut layers = Vec::with_capacity(frame.layers.len());
-        let size = frame.size.max(glam::Vec2::ONE);
-        // Frame units to clip space: (0, 0) is the top-left corner.
-        let clip_from_frame = Mat4::from_translation(Vec3::new(-1.0, -1.0, 0.0))
-            * Mat4::from_scale(Vec3::new(2.0 / size.x, 2.0 / size.y, 1.0));
+        let clip_from_frame = clip_from_frame(frame);
 
         for layer in &frame.layers {
             let mut order: Vec<u32> = (0..layer.quads.len() as u32).collect();
@@ -1127,6 +1289,7 @@ impl Renderer {
         cmd: vk::CommandBuffer,
         frame: &Frame,
         layers: &[LayerDraw],
+        meshes: &[MeshDraw],
         slot: usize,
         image_index: usize,
         capture_into: Option<vk::Buffer>,
@@ -1228,6 +1391,50 @@ impl Renderer {
                 }
             }
         }
+
+        let frame_slot = &self.frames[slot];
+        if let (Some(vertices), Some(indices), false) = (
+            &frame_slot.mesh_vertices.buffer,
+            &frame_slot.mesh_indices.buffer,
+            meshes.is_empty(),
+        ) {
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.mesh_pipeline);
+            device.cmd_bind_vertex_buffers(cmd, 0, &[vertices.buffer], &[0]);
+            device.cmd_bind_index_buffer(cmd, indices.buffer, 0, vk::IndexType::UINT32);
+            device.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytemuck::cast_slice(&clip_from_frame(frame).to_cols_array()),
+            );
+            for mesh in meshes {
+                let Some(texture) = self.textures[mesh.texture as usize].as_ref() else {
+                    continue;
+                };
+                let sampler_set = self.sampler_sets[match mesh.filter {
+                    Filter::Smooth => 0,
+                    Filter::Pixelated => 1,
+                }];
+                device.cmd_set_scissor(cmd, 0, &[mesh.scissor]);
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &[sampler_set, texture.set],
+                    &[],
+                );
+                device.cmd_draw_indexed(
+                    cmd,
+                    mesh.index_count,
+                    1,
+                    mesh.first_index,
+                    mesh.vertex_offset,
+                    0,
+                );
+            }
+        }
         self.rendering.cmd_end_rendering(cmd);
 
         match capture_into {
@@ -1304,7 +1511,14 @@ impl Drop for Renderer {
                 self.free_texture(texture);
             }
             for slot in std::mem::take(&mut self.frames) {
-                if let Some(buffer) = slot.instances {
+                for buffer in [
+                    slot.instances,
+                    slot.mesh_vertices.buffer,
+                    slot.mesh_indices.buffer,
+                ]
+                .into_iter()
+                .flatten()
+                {
                     self.destroy_buffer(buffer);
                 }
                 self.device.destroy_fence(slot.fence, None);
@@ -1316,6 +1530,7 @@ impl Drop for Renderer {
             for sampler in self.samplers {
                 self.device.destroy_sampler(sampler, None);
             }
+            self.device.destroy_pipeline(self.mesh_pipeline, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
@@ -1567,12 +1782,83 @@ unsafe fn create_swapchain(
     })
 }
 
-unsafe fn create_pipeline(
+/// Frame units to clip space: `(0, 0)` is the top-left corner.
+fn clip_from_frame(frame: &Frame) -> Mat4 {
+    let size = frame.size.max(glam::Vec2::ONE);
+    Mat4::from_translation(Vec3::new(-1.0, -1.0, 0.0))
+        * Mat4::from_scale(Vec3::new(2.0 / size.x, 2.0 / size.y, 1.0))
+}
+
+/// The pipeline that draws instanced quads: sprites and text.
+unsafe fn create_quad_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
     color_format: vk::Format,
 ) -> Result<vk::Pipeline, RenderError> {
-    let spirv = compile_wgsl(QUAD_WGSL)?;
+    let attribute = |location: u32, format: vk::Format, offset: u32| {
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(location)
+            .format(format)
+            .offset(offset)
+    };
+    create_pipeline(
+        device,
+        layout,
+        color_format,
+        QUAD_WGSL,
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<Instance>() as u32)
+            .input_rate(vk::VertexInputRate::INSTANCE),
+        &[
+            attribute(0, vk::Format::R32G32B32A32_SFLOAT, 0),
+            attribute(1, vk::Format::R32G32_SFLOAT, 16),
+            attribute(2, vk::Format::R32G32B32A32_SFLOAT, 24),
+            attribute(3, vk::Format::R32G32B32A32_SFLOAT, 40),
+        ],
+    )
+}
+
+/// The pipeline that draws indexed triangle meshes: the editor's UI.
+unsafe fn create_mesh_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    color_format: vk::Format,
+) -> Result<vk::Pipeline, RenderError> {
+    let attribute = |location: u32, format: vk::Format, offset: u32| {
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(location)
+            .format(format)
+            .offset(offset)
+    };
+    create_pipeline(
+        device,
+        layout,
+        color_format,
+        MESH_WGSL,
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<MeshVertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX),
+        &[
+            attribute(0, vk::Format::R32G32_SFLOAT, 0),
+            attribute(1, vk::Format::R32G32_SFLOAT, 8),
+            attribute(2, vk::Format::R8G8B8A8_UNORM, 16),
+        ],
+    )
+}
+
+unsafe fn create_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    color_format: vk::Format,
+    shader: &str,
+    binding: vk::VertexInputBindingDescription,
+    attributes: &[vk::VertexInputAttributeDescription],
+) -> Result<vk::Pipeline, RenderError> {
+    let spirv = compile_wgsl(shader)?;
     let module = device
         .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spirv), None)
         .map_err(vk_err("creating the shader"))?;
@@ -1586,26 +1872,10 @@ unsafe fn create_pipeline(
             .module(module)
             .name(c"fs_main"),
     ];
-    let bindings = [vk::VertexInputBindingDescription::default()
-        .binding(0)
-        .stride(std::mem::size_of::<Instance>() as u32)
-        .input_rate(vk::VertexInputRate::INSTANCE)];
-    let attribute = |location: u32, format: vk::Format, offset: u32| {
-        vk::VertexInputAttributeDescription::default()
-            .binding(0)
-            .location(location)
-            .format(format)
-            .offset(offset)
-    };
-    let attributes = [
-        attribute(0, vk::Format::R32G32B32A32_SFLOAT, 0),
-        attribute(1, vk::Format::R32G32_SFLOAT, 16),
-        attribute(2, vk::Format::R32G32B32A32_SFLOAT, 24),
-        attribute(3, vk::Format::R32G32B32A32_SFLOAT, 40),
-    ];
+    let bindings = [binding];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)
-        .vertex_attribute_descriptions(&attributes);
+        .vertex_attribute_descriptions(attributes);
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
     let viewport = vk::PipelineViewportStateCreateInfo::default()
@@ -1706,5 +1976,6 @@ mod tests {
     #[test]
     fn instance_layout_matches_the_pipeline() {
         assert_eq!(std::mem::size_of::<Instance>(), 56);
+        assert_eq!(std::mem::size_of::<MeshVertex>(), 20);
     }
 }

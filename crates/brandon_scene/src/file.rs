@@ -128,9 +128,7 @@ impl Clone for BehaviourList {
         BehaviourList(
             self.0
                 .iter()
-                .filter_map(|b| {
-                    registry::entry_for(b.as_ref()).map(|entry| (entry.clone)(b.as_ref()))
-                })
+                .filter_map(|b| clone_behaviour(b.as_ref()))
                 .collect(),
         )
     }
@@ -276,6 +274,13 @@ impl SceneLibrary {
         self.build(assets, &data, &mut chain)
     }
 
+    /// Reads scene-file text as the scene being run or edited, loading the
+    /// scene files it places.
+    pub fn load_text(&self, assets: &Assets, text: &str) -> Result<Node, SceneError> {
+        let data = NodeData::parse("<text>", text)?;
+        self.build(assets, &data, &mut Vec::new())
+    }
+
     /// Creates a copy of a scene file to place inside another scene. The
     /// returned node remembers which file it came from.
     pub fn instantiate(&self, assets: &Assets, path: &str) -> Result<Node, SceneError> {
@@ -378,7 +383,18 @@ impl Scene {
     /// Behaviours that were not [registered](crate::register) are left out,
     /// with a warning.
     pub fn to_ron(&self, id: NodeId) -> Result<String, SceneError> {
-        let data = self.to_data(id, true).ok_or(SceneError::MissingNode)?;
+        self.write(id, true)
+    }
+
+    /// Like [`to_ron`](Self::to_ron), but if the node itself was placed from
+    /// another scene file it is written as a reference too. This is the text
+    /// to use for copying a node within a scene.
+    pub fn copy_to_ron(&self, id: NodeId) -> Result<String, SceneError> {
+        self.write(id, false)
+    }
+
+    fn write(&self, id: NodeId, expand_root: bool) -> Result<String, SceneError> {
+        let data = self.to_data(id, expand_root).ok_or(SceneError::MissingNode)?;
         let pretty = ron::ser::PrettyConfig::new()
             .struct_names(false)
             .indentor("    ".to_string());

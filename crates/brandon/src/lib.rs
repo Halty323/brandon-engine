@@ -42,7 +42,7 @@
 //! window.
 
 mod app;
-mod draw;
+pub mod draw;
 mod game;
 mod keys;
 

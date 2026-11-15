@@ -216,6 +216,7 @@ impl App {
             self.background,
             window_size,
             graphics.window.scale_factor() as f32,
+            None,
         )?;
         let capturing = self
             .capture

@@ -1,22 +1,32 @@
 //! Turns a scene into quads for the renderer.
+//!
+//! Games do not need this module: [`Game`](crate::Game) draws the scene for
+//! you. It is public for tools that draw scenes themselves, such as the
+//! editor.
 
 use brandon_core::{Assets, Color, ImageData};
 use brandon_render::{
     Filter, Frame, Layer, Quad, RenderError, Renderer, TextLayout, TextRenderer, Texture,
 };
-use brandon_scene::{Align, Scene, Sprite, Visible};
+use brandon_scene::{Align, Node, Scene, Sprite, Visible};
 use glam::{Affine2, Vec2};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Loads textures on first use and remembers them.
-pub(crate) struct Textures {
+pub struct Textures {
     loaded: HashMap<String, Texture>,
     missing: Option<Texture>,
 }
 
+impl Default for Textures {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Textures {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Textures {
             loaded: HashMap::new(),
             missing: None,
@@ -25,7 +35,7 @@ impl Textures {
 
     /// The texture for an asset path. If it cannot be loaded, the problem is
     /// logged once and a bright checkerboard is shown instead.
-    fn get(&mut self, renderer: &mut Renderer, assets: &Assets, path: &str) -> Texture {
+    pub fn get(&mut self, renderer: &mut Renderer, assets: &Assets, path: &str) -> Texture {
         if let Some(texture) = self.loaded.get(path) {
             return *texture;
         }
@@ -58,8 +68,18 @@ impl Textures {
         texture
     }
 
-    fn is_missing(&self, texture: Texture) -> bool {
+    /// Is this the stand-in shown for images that could not be loaded?
+    pub fn is_missing(&self, texture: Texture) -> bool {
         self.missing == Some(texture)
+    }
+
+    /// Forgets every loaded image, so files changed on disk are read again.
+    pub fn clear(&mut self, renderer: &mut Renderer) {
+        for (_, texture) in self.loaded.drain() {
+            if Some(texture) != self.missing {
+                renderer.destroy_texture(texture);
+            }
+        }
     }
 }
 
@@ -73,16 +93,70 @@ struct PendingText {
     at: usize,
 }
 
+/// The size a sprite is drawn at, given its texture.
+fn sprite_size(sprite: &Sprite, texture: Texture, missing: bool) -> Vec2 {
+    let has_image = sprite.texture.is_some() && !missing;
+    sprite
+        .size
+        .or(sprite.region.filter(|_| has_image).map(|r| r.size()))
+        .or(has_image.then_some(texture.size()))
+        .unwrap_or(Sprite::DEFAULT_SIZE)
+}
+
+/// The area a node's sprite and text cover, in the node's own space, as
+/// `(top-left corner, size)`. `None` if the node draws nothing.
+pub fn local_bounds(
+    node: &Node,
+    renderer: &mut Renderer,
+    text: &mut TextRenderer,
+    textures: &mut Textures,
+    assets: &Assets,
+) -> Option<(Vec2, Vec2)> {
+    let mut bounds: Option<(Vec2, Vec2)> = None;
+    let mut include = |min: Vec2, max: Vec2| {
+        bounds = Some(match bounds {
+            Some((lo, hi)) => (lo.min(min), hi.max(max)),
+            None => (min, max),
+        });
+    };
+    if let Some(sprite) = &node.sprite {
+        let (texture, missing) = match &sprite.texture {
+            Some(path) => {
+                let texture = textures.get(renderer, assets, path);
+                (texture, textures.is_missing(texture))
+            }
+            None => (renderer.white(), false),
+        };
+        let size = sprite_size(sprite, texture, missing);
+        let corner = -sprite.anchor * size;
+        include(corner, corner + size);
+    }
+    if let Some(label) = &node.text {
+        let align = align_factor(label.align);
+        let layout = text.layout(&label.text, label.size, 1.0, align);
+        let left = -layout.width * align;
+        include(
+            Vec2::new(left, 0.0),
+            Vec2::new(left + layout.width, layout.height),
+        );
+    }
+    bounds.map(|(min, max)| (min, max - min))
+}
+
+fn align_factor(align: Align) -> f32 {
+    match align {
+        Align::Left => 0.0,
+        Align::Center => 0.5,
+        Align::Right => 1.0,
+    }
+}
+
 fn sprite_quad(sprite: &Sprite, texture: Texture, missing: bool, at: &Visible) -> Quad {
     let texture_size = texture.size();
     let region = sprite
         .region
         .filter(|_| sprite.texture.is_some() && !missing);
-    let size = sprite
-        .size
-        .or(region.map(|r| r.size()))
-        .or((sprite.texture.is_some() && !missing).then_some(texture_size))
-        .unwrap_or(Sprite::DEFAULT_SIZE);
+    let size = sprite_size(sprite, texture, missing);
     let mut uv = match region {
         Some(r) => [
             r.x / texture_size.x,
@@ -116,8 +190,12 @@ fn sprite_quad(sprite: &Sprite, texture: Texture, missing: bool, at: &Visible) -
 
 /// Builds the frame to draw: the world as seen by the camera, then overlays
 /// fixed to the window.
+///
+/// With `view_override`, the scene's own camera is ignored and everything,
+/// overlays included, is drawn through that view. The editor uses this to
+/// look at a scene from anywhere.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_frame(
+pub fn build_frame(
     scene: &Scene,
     renderer: &mut Renderer,
     text: &mut TextRenderer,
@@ -126,8 +204,11 @@ pub(crate) fn build_frame(
     clear: Color,
     window_size: Vec2,
     pixels_per_unit: f32,
+    view_override: Option<Affine2>,
 ) -> Result<Frame, RenderError> {
-    let view = scene.view_transform(window_size);
+    let view = view_override.unwrap_or_else(|| scene.view_transform(window_size));
+    let overlay_view = view_override.unwrap_or(Affine2::IDENTITY);
+    let overlay_zoom = overlay_view.matrix2.x_axis.length();
     let view_zoom = view.matrix2.x_axis.length();
     let mut world_quads: Vec<Quad> = Vec::new();
     let mut overlay_quads: Vec<Quad> = Vec::new();
@@ -152,14 +233,9 @@ pub(crate) fn build_frame(
         if let Some(label) = &node.text {
             // Rasterise glyphs at the size they appear on screen, so text
             // stays sharp under scaling and zoom.
-            let on_screen =
-                at.world.matrix2.y_axis.length() * if at.overlay { 1.0 } else { view_zoom };
-            let scale = quantise(pixels_per_unit * on_screen);
-            let align = match label.align {
-                Align::Left => 0.0,
-                Align::Center => 0.5,
-                Align::Right => 1.0,
-            };
+            let zoom = if at.overlay { overlay_zoom } else { view_zoom };
+            let scale = quantise(pixels_per_unit * at.world.matrix2.y_axis.length() * zoom);
+            let align = align_factor(label.align);
             texts.push(PendingText {
                 layout: text.layout(&label.text, label.size, scale, align),
                 world: at.world,
@@ -202,10 +278,11 @@ pub(crate) fn build_frame(
                 quads: world_quads,
             },
             Layer {
-                view: Affine2::IDENTITY,
+                view: overlay_view,
                 quads: overlay_quads,
             },
         ],
+        ui: Vec::new(),
     })
 }
 

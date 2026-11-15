@@ -11,7 +11,7 @@ mod shader;
 mod text;
 
 pub use renderer::{Renderer, Texture};
-pub use text::{PlacedGlyph, TextLayout, TextRenderer};
+pub use text::{PlacedGlyph, TextLayout, TextRenderer, DEFAULT_FONT};
 
 use brandon_core::Color;
 use glam::{Affine2, Vec2};
@@ -73,7 +73,32 @@ pub struct Layer {
     pub quads: Vec<Quad>,
 }
 
-/// Everything to draw for one frame. Layers are drawn in order.
+/// One corner of a [`Mesh`] triangle.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MeshVertex {
+    /// Position in frame units (see [`Frame::size`]).
+    pub position: [f32; 2],
+    pub uv: [f32; 2],
+    /// sRGB colour, already multiplied by alpha.
+    pub color: [u8; 4],
+}
+
+/// Free-form textured triangles, for user interfaces.
+#[derive(Clone, Debug)]
+pub struct Mesh {
+    pub vertices: Vec<MeshVertex>,
+    /// Three indices into `vertices` per triangle.
+    pub indices: Vec<u32>,
+    /// Must be a texture made with
+    /// [`Renderer::create_premultiplied_texture`], or the plain white texture.
+    pub texture: Texture,
+    pub filter: Filter,
+    /// Only draw inside this rectangle `[x, y, width, height]`, in frame units.
+    pub clip: Option<[f32; 4]>,
+}
+
+/// Everything to draw for one frame. Layers are drawn in order, then the UI.
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub clear: Color,
@@ -81,4 +106,6 @@ pub struct Frame {
     /// top-left corner. Usually the window size in logical pixels.
     pub size: Vec2,
     pub layers: Vec<Layer>,
+    /// User interface meshes, drawn last and in order.
+    pub ui: Vec<Mesh>,
 }
