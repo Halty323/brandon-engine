@@ -1,0 +1,18 @@
+[package]
+name = "brandon_core"
+description = "Core types for the Brandon engine: maths, colour, time, input and assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+log.workspace = true
+thiserror.workspace = true
+image.workspace = true
+
+[dev-dependencies]
+ron.workspace = true
