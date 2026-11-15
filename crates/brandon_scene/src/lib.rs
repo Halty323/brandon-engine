@@ -24,9 +24,9 @@ mod transform;
 
 pub use behaviour::Behaviour;
 pub use ctx::{Ctx, Requests, View};
-pub use file::{SceneError, SceneLibrary};
+pub use file::{RawBehaviour, SceneError, SceneLibrary};
 pub use node::{Attach, Node};
 pub use parts::{Align, Camera, Overlay, Shape, Sprite, Text};
-pub use registry::{register, register_as};
+pub use registry::{keep_unknown_behaviours, register, register_as};
 pub use scene::{NodeId, Scene, Visible};
 pub use transform::Transform;

@@ -32,10 +32,43 @@ fn is_true(v: &bool) -> bool {
     *v
 }
 
+/// A behaviour whose Rust type is not known to this program.
+///
+/// It does nothing when the scene runs. It exists so tools such as the
+/// editor can open, change and save scenes without the game's code. See
+/// [`keep_unknown_behaviours`](crate::keep_unknown_behaviours).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawBehaviour {
+    /// The name the behaviour has in scene files.
+    pub name: String,
+    /// The behaviour's data as scene-file text, for example `(speed: 200.0)`.
+    pub ron: String,
+}
+
+impl RawBehaviour {
+    pub fn new(name: impl Into<String>, ron: impl Into<String>) -> Self {
+        RawBehaviour { name: name.into(), ron: ron.into() }
+    }
+}
+
+impl Behaviour for RawBehaviour {}
+
+fn as_raw(behaviour: &dyn Behaviour) -> Option<&RawBehaviour> {
+    (behaviour as &dyn std::any::Any).downcast_ref::<RawBehaviour>()
+}
+
+/// Copies a behaviour, if it is registered or raw.
+fn clone_behaviour(behaviour: &dyn Behaviour) -> Option<Box<dyn Behaviour>> {
+    match as_raw(behaviour) {
+        Some(raw) => Some(Box::new(raw.clone())),
+        None => registry::entry_for(behaviour).map(|entry| (entry.clone)(behaviour)),
+    }
+}
+
 /// A node as it is written in a scene file.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct NodeData {
+pub(crate) struct NodeData {
     #[serde(skip_serializing_if = "String::is_empty")]
     name: String,
     /// Another scene file to place here.
@@ -107,8 +140,13 @@ impl Serialize for BehaviourList {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(self.0.len()))?;
         for behaviour in &self.0 {
-            // Only registered behaviours get into a `BehaviourList`.
-            if let Some(entry) = registry::entry_for(behaviour.as_ref()) {
+            // Only registered and raw behaviours get into a `BehaviourList`.
+            if let Some(raw) = as_raw(behaviour.as_ref()) {
+                let value = ron::value::RawValue::from_ron(&raw.ron).map_err(|e| {
+                    serde::ser::Error::custom(format!("the data of behaviour `{}` is not valid: {}", raw.name, e.code))
+                })?;
+                map.serialize_entry(&raw.name, value)?;
+            } else if let Some(entry) = registry::entry_for(behaviour.as_ref()) {
                 map.serialize_entry(&entry.name, (entry.serialize)(behaviour.as_ref()))?;
             }
         }
@@ -144,9 +182,14 @@ impl<'de> Deserialize<'de> for BehaviourList {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<BehaviourList, A::Error> {
-                let mut list = Vec::new();
+                let mut list: Vec<Box<dyn Behaviour>> = Vec::new();
                 while let Some(name) = map.next_key::<String>()? {
                     let Some(entry) = registry::entry_by_name(&name) else {
+                        if registry::keeps_unknown() {
+                            let value: Box<ron::value::RawValue> = map.next_value()?;
+                            list.push(Box::new(RawBehaviour { name, ron: value.get_ron().trim().to_string() }));
+                            continue;
+                        }
                         let known = registry::known_names();
                         let hint = if known.is_empty() {
                             "no behaviours are registered".to_string()
@@ -157,7 +200,8 @@ impl<'de> Deserialize<'de> for BehaviourList {
                             "unknown behaviour `{name}` ({hint}). Register it with `brandon::register::<{name}>()` before loading scenes"
                         )));
                     };
-                    list.push(map.next_value_seed(Seed(entry))?);
+                    let behaviour: Box<dyn Behaviour> = map.next_value_seed(Seed(entry))?;
+                    list.push(behaviour);
                 }
                 Ok(BehaviourList(list))
             }
@@ -289,6 +333,7 @@ impl SceneLibrary {
                 let mut base = self.build(assets, &placed, chain)?;
                 chain.pop();
                 base.instance = Some(path.clone());
+                base.placed_as = Some(Box::new(data.clone()));
                 if !data.name.is_empty() {
                     base.name = data.name.clone();
                 }
@@ -328,7 +373,8 @@ impl Scene {
     /// Writes a node and everything under it as scene-file text.
     ///
     /// Nodes that were placed from another scene file are written as a
-    /// reference to that file, with their name, transform and visibility.
+    /// reference to that file, with their current name, transform and
+    /// visibility, plus whatever else the file that placed them said.
     /// Behaviours that were not [registered](crate::register) are left out,
     /// with a warning.
     pub fn to_ron(&self, id: NodeId) -> Result<String, SceneError> {
@@ -350,14 +396,14 @@ impl Scene {
                     instance: Some(path.clone()),
                     transform: node.transform,
                     visible: node.visible,
-                    ..Default::default()
+                    ..node.placed_as.as_deref().cloned().unwrap_or_default()
                 });
             }
         }
         let mut behaviours = Vec::new();
         for behaviour in node.behaviours.iter().filter_map(|slot| slot.get()) {
-            match registry::entry_for(behaviour) {
-                Some(entry) => behaviours.push((entry.clone)(behaviour)),
+            match clone_behaviour(behaviour) {
+                Some(copy) => behaviours.push(copy),
                 None => log::warn!(
                     "a behaviour on `{}` is not registered, so it was not saved. Register it with `brandon::register`.",
                     node.name

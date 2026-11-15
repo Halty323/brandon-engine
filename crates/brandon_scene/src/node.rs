@@ -32,6 +32,9 @@ pub struct Node {
     pub(crate) pending_children: Vec<Node>,
     /// The scene file this node was created from, if any.
     pub(crate) instance: Option<String>,
+    /// What the scene file that placed this node said about it, kept so
+    /// saving does not lose it.
+    pub(crate) placed_as: Option<Box<crate::file::NodeData>>,
 }
 
 impl Node {
@@ -50,6 +53,7 @@ impl Node {
             id: NodeId::NONE,
             pending_children: Vec::new(),
             instance: None,
+            placed_as: None,
         }
     }
 
@@ -133,6 +137,37 @@ impl Node {
             .iter_mut()
             .filter_map(BehaviourSlot::get_mut)
             .find_map(|b| (b as &mut dyn Any).downcast_mut::<T>())
+    }
+
+    /// Every attached behaviour of type `T`.
+    pub fn behaviours_of<T: Behaviour>(&self) -> impl Iterator<Item = &T> {
+        self.behaviours.iter().filter_map(BehaviourSlot::get).filter_map(|b| (b as &dyn Any).downcast_ref::<T>())
+    }
+
+    /// Every attached behaviour of type `T`, mutably.
+    pub fn behaviours_of_mut<T: Behaviour>(&mut self) -> impl Iterator<Item = &mut T> {
+        self.behaviours
+            .iter_mut()
+            .filter_map(BehaviourSlot::get_mut)
+            .filter_map(|b| (b as &mut dyn Any).downcast_mut::<T>())
+    }
+
+    /// Detaches the `index`-th behaviour of type `T` (counting from zero).
+    /// Returns whether there was one.
+    pub fn remove_nth_behaviour<T: Behaviour>(&mut self, index: usize) -> bool {
+        let slot = self
+            .behaviours
+            .iter_mut()
+            .filter(|slot| slot.get().is_some_and(|b| (b as &dyn Any).is::<T>()))
+            .nth(index);
+        match slot {
+            Some(slot) => {
+                slot.removed = true;
+                slot.behaviour = None;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Is a behaviour of type `T` attached?

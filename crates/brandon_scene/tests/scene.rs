@@ -577,3 +577,42 @@ fn instantiate_from_a_behaviour() {
         Vec2::new(7.0, 9.0)
     );
 }
+
+#[test]
+fn unknown_behaviours_can_be_kept_for_tools() {
+    // This test flips a global switch, so it uses a behaviour name no other test uses.
+    let text = r#"(name: "x", behaviours: {
+        "OnlyTheGameKnowsThis": (speed: 460, kind: Rock, path: [(1, 2), (3, 4)], label: "a) b"),
+        "AlsoUnknownUnit": (),
+    })"#;
+    assert!(Node::from_ron(text).is_err());
+
+    keep_unknown_behaviours(true);
+    let loaded = Node::from_ron(text);
+    keep_unknown_behaviours(false);
+    let node = loaded.unwrap();
+
+    let raws: Vec<&RawBehaviour> = node.behaviours_of::<RawBehaviour>().collect();
+    assert_eq!(raws.len(), 2);
+    assert_eq!(raws[0].name, "OnlyTheGameKnowsThis");
+    assert_eq!(raws[0].ron, r#"(speed: 460, kind: Rock, path: [(1, 2), (3, 4)], label: "a) b")"#);
+    assert_eq!(raws[1], &RawBehaviour::new("AlsoUnknownUnit", "()"));
+
+    // Saved again, the data is unchanged, and edits made by a tool are kept.
+    let mut scene = Scene::new();
+    let id = scene.spawn(node);
+    let saved = scene.to_ron(id).unwrap();
+    assert!(saved.contains(r#""OnlyTheGameKnowsThis": (speed: 460, kind: Rock, path: [(1, 2), (3, 4)], label: "a) b")"#), "{saved}");
+
+    let node = scene.get_mut(id).unwrap();
+    node.behaviours_of_mut::<RawBehaviour>().next().unwrap().ron = "(speed: 500)".to_string();
+    assert!(node.remove_nth_behaviour::<RawBehaviour>(1));
+    assert!(!node.remove_nth_behaviour::<RawBehaviour>(1));
+    let saved = scene.to_ron(id).unwrap();
+    assert!(saved.contains(r#""OnlyTheGameKnowsThis": (speed: 500)"#) && !saved.contains("AlsoUnknownUnit"), "{saved}");
+
+    // Broken data is refused when saving instead of writing a broken file.
+    scene.get_mut(id).unwrap().behaviours_of_mut::<RawBehaviour>().next().unwrap().ron = "(speed: ".to_string();
+    let err = scene.to_ron(id).unwrap_err().to_string();
+    assert!(err.contains("OnlyTheGameKnowsThis"), "{err}");
+}

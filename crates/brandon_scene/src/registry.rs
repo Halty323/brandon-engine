@@ -3,6 +3,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 type DeserializeFn =
@@ -103,4 +104,21 @@ pub(crate) fn known_names() -> Vec<String> {
     let mut names: Vec<String> = registry().read().unwrap().by_name.keys().cloned().collect();
     names.sort();
     names
+}
+
+static KEEP_UNKNOWN: AtomicBool = AtomicBool::new(false);
+
+/// Chooses what happens when a scene file names a behaviour that is not
+/// registered.
+///
+/// Normally that is a mistake and loading fails. Tools that open scenes
+/// without the game's code, such as the editor, turn this on: unknown
+/// behaviours are then kept as [`RawBehaviour`](crate::RawBehaviour)s, which
+/// do nothing but are written back unchanged when the scene is saved.
+pub fn keep_unknown_behaviours(keep: bool) {
+    KEEP_UNKNOWN.store(keep, Ordering::Relaxed);
+}
+
+pub(crate) fn keeps_unknown() -> bool {
+    KEEP_UNKNOWN.load(Ordering::Relaxed)
 }
