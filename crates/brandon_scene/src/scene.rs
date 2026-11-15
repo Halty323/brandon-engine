@@ -219,6 +219,24 @@ impl Scene {
         true
     }
 
+    /// Moves a node to position `index` among the children of `new_parent`
+    /// (or among the top-level nodes with `None`). An index past the end
+    /// puts it last. The node keeps its local transform. Returns `false` if
+    /// that is not possible, for example because it would make a node its
+    /// own ancestor.
+    pub fn move_to(&mut self, id: NodeId, new_parent: Option<NodeId>, index: usize) -> bool {
+        if !self.set_parent(id, new_parent) {
+            return false;
+        }
+        let siblings = match new_parent {
+            Some(p) => &mut self.slots[p.index as usize].children,
+            None => &mut self.roots,
+        };
+        siblings.retain(|c| *c != id);
+        siblings.insert(index.min(siblings.len()), id);
+        true
+    }
+
     // --- Looking things up ----------------------------------------------
 
     fn slot(&self, id: NodeId) -> Option<&Slot> {

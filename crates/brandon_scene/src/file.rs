@@ -47,7 +47,10 @@ pub struct RawBehaviour {
 
 impl RawBehaviour {
     pub fn new(name: impl Into<String>, ron: impl Into<String>) -> Self {
-        RawBehaviour { name: name.into(), ron: ron.into() }
+        RawBehaviour {
+            name: name.into(),
+            ron: ron.into(),
+        }
     }
 }
 
@@ -141,7 +144,10 @@ impl Serialize for BehaviourList {
             // Only registered and raw behaviours get into a `BehaviourList`.
             if let Some(raw) = as_raw(behaviour.as_ref()) {
                 let value = ron::value::RawValue::from_ron(&raw.ron).map_err(|e| {
-                    serde::ser::Error::custom(format!("the data of behaviour `{}` is not valid: {}", raw.name, e.code))
+                    serde::ser::Error::custom(format!(
+                        "the data of behaviour `{}` is not valid: {}",
+                        raw.name, e.code
+                    ))
                 })?;
                 map.serialize_entry(&raw.name, value)?;
             } else if let Some(entry) = registry::entry_for(behaviour.as_ref()) {
@@ -185,7 +191,10 @@ impl<'de> Deserialize<'de> for BehaviourList {
                     let Some(entry) = registry::entry_by_name(&name) else {
                         if registry::keeps_unknown() {
                             let value: Box<ron::value::RawValue> = map.next_value()?;
-                            list.push(Box::new(RawBehaviour { name, ron: value.get_ron().trim().to_string() }));
+                            list.push(Box::new(RawBehaviour {
+                                name,
+                                ron: value.get_ron().trim().to_string(),
+                            }));
                             continue;
                         }
                         let known = registry::known_names();
@@ -394,12 +403,15 @@ impl Scene {
     }
 
     fn write(&self, id: NodeId, expand_root: bool) -> Result<String, SceneError> {
-        let data = self.to_data(id, expand_root).ok_or(SceneError::MissingNode)?;
+        let data = self
+            .to_data(id, expand_root)
+            .ok_or(SceneError::MissingNode)?;
         let pretty = ron::ser::PrettyConfig::new()
             .struct_names(false)
             .indentor("    ".to_string());
         ron_options()
             .to_string_pretty(&data, pretty)
+            .map(|text| crate::layout::tidy(&text))
             .map_err(|e| SceneError::Write(e.to_string()))
     }
 

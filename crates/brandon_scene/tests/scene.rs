@@ -98,6 +98,18 @@ fn set_parent_refuses_cycles() {
     assert!(scene.set_parent(c, Some(a)));
     assert_eq!(scene.children(a), [b, c]);
     assert!(scene.roots() == [a]);
+
+    assert!(scene.move_to(c, Some(a), 0));
+    assert_eq!(scene.children(a), [c, b]);
+    assert!(scene.move_to(c, Some(a), 99));
+    assert_eq!(scene.children(a), [b, c]);
+    assert!(scene.move_to(b, None, 0));
+    assert_eq!(scene.roots(), [b, a]);
+    assert!(
+        !scene.move_to(a, Some(c), 0),
+        "a node cannot go inside its own child"
+    );
+    assert_eq!(scene.roots(), [b, a]);
 }
 
 #[test]
@@ -595,24 +607,44 @@ fn unknown_behaviours_can_be_kept_for_tools() {
     let raws: Vec<&RawBehaviour> = node.behaviours_of::<RawBehaviour>().collect();
     assert_eq!(raws.len(), 2);
     assert_eq!(raws[0].name, "OnlyTheGameKnowsThis");
-    assert_eq!(raws[0].ron, r#"(speed: 460, kind: Rock, path: [(1, 2), (3, 4)], label: "a) b")"#);
+    assert_eq!(
+        raws[0].ron,
+        r#"(speed: 460, kind: Rock, path: [(1, 2), (3, 4)], label: "a) b")"#
+    );
     assert_eq!(raws[1], &RawBehaviour::new("AlsoUnknownUnit", "()"));
 
     // Saved again, the data is unchanged, and edits made by a tool are kept.
     let mut scene = Scene::new();
     let id = scene.spawn(node);
     let saved = scene.to_ron(id).unwrap();
-    assert!(saved.contains(r#""OnlyTheGameKnowsThis": (speed: 460, kind: Rock, path: [(1, 2), (3, 4)], label: "a) b")"#), "{saved}");
+    // Too long for one line, so it is laid out over several.
+    let expected = r#"        "OnlyTheGameKnowsThis": (
+            speed: 460,
+            kind: Rock,
+            path: [(1, 2), (3, 4)],
+            label: "a) b",
+        ),"#;
+    assert!(saved.contains(expected), "{saved}");
 
     let node = scene.get_mut(id).unwrap();
     node.behaviours_of_mut::<RawBehaviour>().next().unwrap().ron = "(speed: 500)".to_string();
     assert!(node.remove_nth_behaviour::<RawBehaviour>(1));
     assert!(!node.remove_nth_behaviour::<RawBehaviour>(1));
     let saved = scene.to_ron(id).unwrap();
-    assert!(saved.contains(r#""OnlyTheGameKnowsThis": (speed: 500)"#) && !saved.contains("AlsoUnknownUnit"), "{saved}");
+    assert!(
+        saved.contains(r#""OnlyTheGameKnowsThis": (speed: 500)"#)
+            && !saved.contains("AlsoUnknownUnit"),
+        "{saved}"
+    );
 
     // Broken data is refused when saving instead of writing a broken file.
-    scene.get_mut(id).unwrap().behaviours_of_mut::<RawBehaviour>().next().unwrap().ron = "(speed: ".to_string();
+    scene
+        .get_mut(id)
+        .unwrap()
+        .behaviours_of_mut::<RawBehaviour>()
+        .next()
+        .unwrap()
+        .ron = "(speed: ".to_string();
     let err = scene.to_ron(id).unwrap_err().to_string();
     assert!(err.contains("OnlyTheGameKnowsThis"), "{err}");
 }

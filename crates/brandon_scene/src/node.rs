@@ -141,7 +141,10 @@ impl Node {
 
     /// Every attached behaviour of type `T`.
     pub fn behaviours_of<T: Behaviour>(&self) -> impl Iterator<Item = &T> {
-        self.behaviours.iter().filter_map(BehaviourSlot::get).filter_map(|b| (b as &dyn Any).downcast_ref::<T>())
+        self.behaviours
+            .iter()
+            .filter_map(BehaviourSlot::get)
+            .filter_map(|b| (b as &dyn Any).downcast_ref::<T>())
     }
 
     /// Every attached behaviour of type `T`, mutably.
