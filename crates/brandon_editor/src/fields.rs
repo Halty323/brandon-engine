@@ -22,7 +22,7 @@ pub enum Kind {
 impl Field {
     pub fn kind(&self) -> Kind {
         let value = self.value.trim();
-        if let Ok(number) = value.parse::<f64>() {
+        if let Some(number) = value.parse::<f64>().ok().filter(|n| n.is_finite()) {
             return Kind::Number(number);
         }
         match value {
@@ -87,24 +87,43 @@ pub fn split(ron: &str) -> Option<Vec<Field>> {
         if !is_name || value.trim().is_empty() {
             return None;
         }
-        fields.push(Field { name: name.to_string(), value: value.trim().to_string() });
+        fields.push(Field {
+            name: name.to_string(),
+            value: value.trim().to_string(),
+        });
     }
     Some(fields)
 }
 
 /// The opposite of [`split`].
 pub fn join(fields: &[Field]) -> String {
-    let body: Vec<String> = fields.iter().map(|f| format!("{}: {}", f.name, f.value)).collect();
+    let body: Vec<String> = fields
+        .iter()
+        .map(|f| format!("{}: {}", f.name, f.value))
+        .collect();
     format!("({})", body.join(", "))
 }
 
-/// Writes a number the way scene files expect: whole numbers stay short.
-pub fn number_text(value: f64) -> String {
+/// Is this number written without a decimal point? The editor does not
+/// know the game's types, so a whole number is kept whole: it may be read
+/// into an integer, which would refuse `3.5`.
+pub fn is_whole(text: &str) -> bool {
+    !text.trim().contains(['.', 'e', 'E'])
+}
+
+/// Writes a number the way scene files expect. A whole number is written
+/// without a decimal point; any other number keeps one, so it stays a
+/// decimal the next time it is read.
+pub fn number_text(value: f64, whole: bool) -> String {
+    if whole && value.abs() < 1e15 {
+        return format!("{}", value.round() as i64);
+    }
     let rounded = (value * 1000.0).round() / 1000.0;
-    if rounded == rounded.trunc() && rounded.abs() < 1e15 {
-        format!("{}", rounded as i64)
+    let text = format!("{rounded}");
+    if text.contains(['.', 'e', 'E', 'i', 'N']) {
+        text
     } else {
-        format!("{rounded}")
+        format!("{text}.0")
     }
 }
 
@@ -123,7 +142,10 @@ mod tests {
     use super::*;
 
     fn field(name: &str, value: &str) -> Field {
-        Field { name: name.to_string(), value: value.to_string() }
+        Field {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
     }
 
     #[test]
@@ -162,9 +184,15 @@ mod tests {
 
     #[test]
     fn values_are_written_cleanly() {
-        assert_eq!(number_text(460.0), "460");
-        assert_eq!(number_text(0.35), "0.35");
-        assert_eq!(number_text(-1.23456), "-1.235");
+        assert_eq!(number_text(460.0, true), "460");
+        assert_eq!(number_text(3.4, true), "3");
+        assert_eq!(number_text(460.0, false), "460.0");
+        assert_eq!(number_text(0.35, false), "0.35");
+        assert_eq!(number_text(-1.23456, false), "-1.235");
+        assert!(is_whole("90"));
+        assert!(is_whole("-3"));
+        assert!(!is_whole("0.7"));
+        assert!(!is_whole("1e3"));
         assert_eq!(text_value("say \"hi\""), r#""say \"hi\"""#);
         assert!(is_valid("(speed: 1)") && !is_valid("(speed: "));
     }

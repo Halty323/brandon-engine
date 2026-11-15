@@ -1056,7 +1056,6 @@ impl Renderer {
             let cmd = self.frames[slot].cmd;
             let image = self.swapchain.images[image_index];
             self.record(
-                cmd,
                 frame,
                 &layers,
                 &meshes,
@@ -1286,7 +1285,6 @@ impl Renderer {
 
     unsafe fn record(
         &self,
-        cmd: vk::CommandBuffer,
         frame: &Frame,
         layers: &[LayerDraw],
         meshes: &[MeshDraw],
@@ -1295,6 +1293,7 @@ impl Renderer {
         capture_into: Option<vk::Buffer>,
     ) -> Result<(), vk::Result> {
         let device = &self.device;
+        let cmd = self.frames[slot].cmd;
         let image = self.swapchain.images[image_index];
         let extent = self.swapchain.extent;
 

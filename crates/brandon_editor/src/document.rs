@@ -19,8 +19,25 @@ pub struct Document {
     /// The scene as text, as of the last [`commit`](Self::commit).
     current: String,
     saved: String,
+    /// Comment lines at the top of the file, kept when saving. Comments
+    /// elsewhere in the file are not kept.
+    header: String,
     undo: Vec<String>,
     redo: Vec<String>,
+}
+
+/// The comment lines a file starts with, such as a note on what the scene
+/// is for.
+fn leading_comments(text: &str) -> String {
+    let mut header = String::new();
+    for line in text.lines() {
+        if !line.trim_start().starts_with("//") {
+            break;
+        }
+        header.push_str(line);
+        header.push('\n');
+    }
+    header
 }
 
 impl Document {
@@ -35,6 +52,7 @@ impl Document {
             selection: None,
             current: String::new(),
             saved: String::new(),
+            header: String::new(),
             undo: Vec::new(),
             redo: Vec::new(),
         };
@@ -57,6 +75,11 @@ impl Document {
         self.root = self.scene.spawn(root);
         self.path = Some(path.to_string());
         self.selection = None;
+        self.header = self
+            .assets
+            .read_text(path)
+            .map(|text| leading_comments(&text))
+            .unwrap_or_default();
         self.current = self.text();
         self.saved = self.current.clone();
         self.undo.clear();
@@ -66,19 +89,28 @@ impl Document {
 
     /// The folder scene and image files live in.
     pub fn assets_folder(&self) -> Option<&Path> {
-        self.assets.roots().iter().find(|root| root.is_dir()).or(self.assets.roots().first()).map(PathBuf::as_path)
+        self.assets
+            .roots()
+            .iter()
+            .find(|root| root.is_dir())
+            .or(self.assets.roots().first())
+            .map(PathBuf::as_path)
     }
 
     /// Writes the scene to its file. Returns where it was written.
     pub fn save(&mut self) -> Result<PathBuf, String> {
         let path = self.path.clone().ok_or("this scene has no file name yet")?;
         let text = self.scene.to_ron(self.root).map_err(|e| e.to_string())?;
-        let folder = self.assets_folder().ok_or("there is no assets folder to save into")?;
+        let folder = self
+            .assets_folder()
+            .ok_or("there is no assets folder to save into")?;
         let file = folder.join(&path);
         if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
         }
-        std::fs::write(&file, format!("{text}\n")).map_err(|e| format!("could not write {}: {e}", file.display()))?;
+        std::fs::write(&file, format!("{}{text}\n", self.header))
+            .map_err(|e| format!("could not write {}: {e}", file.display()))?;
         self.current = text;
         self.saved = self.current.clone();
         Ok(file)
@@ -92,7 +124,9 @@ impl Document {
     /// Records the scene's current state as an undo step, if it changed
     /// since the last call. Returns whether it changed.
     pub fn commit(&mut self) -> bool {
-        let Ok(text) = self.scene.to_ron(self.root) else { return false };
+        let Ok(text) = self.scene.to_ron(self.root) else {
+            return false;
+        };
         if text == self.current {
             return false;
         }
@@ -114,7 +148,9 @@ impl Document {
 
     pub fn undo(&mut self) -> bool {
         self.commit();
-        let Some(text) = self.undo.pop() else { return false };
+        let Some(text) = self.undo.pop() else {
+            return false;
+        };
         let now = std::mem::replace(&mut self.current, text);
         self.redo.push(now);
         self.restore();
@@ -122,7 +158,9 @@ impl Document {
     }
 
     pub fn redo(&mut self) -> bool {
-        let Some(text) = self.redo.pop() else { return false };
+        let Some(text) = self.redo.pop() else {
+            return false;
+        };
         let now = std::mem::replace(&mut self.current, text);
         self.undo.push(now);
         self.restore();
@@ -149,7 +187,13 @@ impl Document {
         let mut path = Vec::new();
         let mut cursor = id;
         while let Some(parent) = self.scene.parent(cursor) {
-            path.push(self.scene.children(parent).iter().position(|c| *c == cursor).unwrap_or(0));
+            path.push(
+                self.scene
+                    .children(parent)
+                    .iter()
+                    .position(|c| *c == cursor)
+                    .unwrap_or(0),
+            );
             cursor = parent;
         }
         path.reverse();
@@ -170,7 +214,12 @@ impl Document {
     pub fn inside_placed_scene(&self, id: NodeId) -> bool {
         let mut cursor = self.scene.parent(id);
         while let Some(ancestor) = cursor {
-            if ancestor != self.root && self.scene.get(ancestor).is_some_and(|n| n.instance_of().is_some()) {
+            if ancestor != self.root
+                && self
+                    .scene
+                    .get(ancestor)
+                    .is_some_and(|n| n.instance_of().is_some())
+            {
                 return true;
             }
             cursor = self.scene.parent(ancestor);
@@ -191,7 +240,10 @@ impl Document {
     /// Places another scene file under `parent` and selects it.
     pub fn place_scene(&mut self, parent: NodeId, path: &str) -> Result<NodeId, SceneError> {
         if self.path.as_deref() == Some(path) {
-            return Err(SceneError::Cycle { path: path.to_string(), chain: vec![path.to_string(), path.to_string()] });
+            return Err(SceneError::Cycle {
+                path: path.to_string(),
+                chain: vec![path.to_string(), path.to_string()],
+            });
         }
         let node = self.library.instantiate(&self.assets, path)?;
         Ok(self.add_child(parent, node))
@@ -231,12 +283,18 @@ impl Document {
 }
 
 fn collect_files(root: &Path, folder: &Path, extensions: &[&str], found: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(folder) else { return };
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
             collect_files(root, &path, extensions, found);
-        } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| extensions.contains(&e)) {
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| extensions.contains(&e))
+        {
             if let Ok(relative) = path.strip_prefix(root) {
                 found.push(relative.to_string_lossy().replace('\\', "/"));
             }
@@ -251,7 +309,8 @@ mod tests {
 
     fn project(name: &str, files: &[(&str, &str)]) -> Assets {
         keep_unknown_behaviours(true);
-        let dir = std::env::temp_dir().join(format!("brandon-editor-test-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("brandon-editor-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for (file, text) in files {
             let path = dir.join(file);
@@ -262,15 +321,24 @@ mod tests {
         Assets::at(dir)
     }
 
-    const MAIN: &str = r#"(name: "Main", children: [
+    const MAIN: &str = r#"// The first level.
+(name: "Main", children: [
         (name: "Ship", transform: (position: (10, 20)), behaviours: {"Ship": (speed: 460)}),
         (instance: "scenes/rock.scene", transform: (position: (5, 5))),
     ])"#;
-    const ROCK: &str = r#"(name: "Rock", sprite: (texture: "rock.png"), children: [(name: "Dust")])"#;
+    const ROCK: &str =
+        r#"(name: "Rock", sprite: (texture: "rock.png"), children: [(name: "Dust")])"#;
 
     #[test]
     fn open_edit_undo_redo_save() {
-        let assets = project("edit", &[("scenes/main.scene", MAIN), ("scenes/rock.scene", ROCK), ("rock.png", "")]);
+        let assets = project(
+            "edit",
+            &[
+                ("scenes/main.scene", MAIN),
+                ("scenes/rock.scene", ROCK),
+                ("rock.png", ""),
+            ],
+        );
         let mut doc = Document::new(assets);
         assert!(!doc.is_dirty() && doc.path.is_none());
         assert!(doc.save().is_err(), "a new scene has no file name");
@@ -288,17 +356,34 @@ mod tests {
 
         // Behaviours the editor has no code for are kept and can be edited.
         let ship_node = doc.scene.get_mut(ship).unwrap();
-        ship_node.behaviours_of_mut::<RawBehaviour>().next().unwrap().ron = "(speed: 500)".to_string();
+        ship_node
+            .behaviours_of_mut::<RawBehaviour>()
+            .next()
+            .unwrap()
+            .ron = "(speed: 500)".to_string();
         doc.commit();
 
         assert!(doc.undo());
-        let ship = doc.selection.expect("the selection follows the node through undo");
+        let ship = doc
+            .selection
+            .expect("the selection follows the node through undo");
         let node = doc.scene.get(ship).unwrap();
         assert_eq!(node.name, "Ship");
-        assert_eq!(node.behaviours_of::<RawBehaviour>().next().unwrap().ron, "(speed: 460)");
+        assert_eq!(
+            node.behaviours_of::<RawBehaviour>().next().unwrap().ron,
+            "(speed: 460)"
+        );
         assert_eq!(node.transform.position.x, 99.0);
         assert!(doc.undo());
-        assert_eq!(doc.scene.get(doc.selection.unwrap()).unwrap().transform.position.x, 10.0);
+        assert_eq!(
+            doc.scene
+                .get(doc.selection.unwrap())
+                .unwrap()
+                .transform
+                .position
+                .x,
+            10.0
+        );
         assert!(!doc.undo() && !doc.is_dirty());
         assert!(doc.redo() && doc.redo() && !doc.redo());
         assert!(doc.is_dirty());
@@ -306,8 +391,19 @@ mod tests {
         let file = doc.save().unwrap();
         assert!(!doc.is_dirty());
         let written = std::fs::read_to_string(file).unwrap();
-        assert!(written.contains("\"Ship\": (speed: 500)") && written.contains("99.0"), "{written}");
-        assert!(written.contains("instance: \"scenes/rock.scene\"") && !written.contains("Dust"), "{written}");
+        assert!(
+            written.contains("\"Ship\": (speed: 500)") && written.contains("99.0"),
+            "{written}"
+        );
+        assert!(
+            written.contains("instance: \"scenes/rock.scene\"") && !written.contains("Dust"),
+            "{written}"
+        );
+        assert!(written.starts_with("// The first level.\n("), "{written}");
+        assert!(
+            written.contains("transform: (position: (99.0, 20.0)),"),
+            "{written}"
+        );
 
         // What was saved opens again and is the same scene.
         let before = doc.scene.to_ron(doc.root).unwrap();
@@ -317,13 +413,20 @@ mod tests {
 
     #[test]
     fn tree_changes() {
-        let assets = project("tree", &[("scenes/main.scene", MAIN), ("scenes/rock.scene", ROCK)]);
+        let assets = project(
+            "tree",
+            &[("scenes/main.scene", MAIN), ("scenes/rock.scene", ROCK)],
+        );
         let mut doc = Document::new(assets);
         doc.open("scenes/main.scene").unwrap();
         let ship = doc.scene.find("Ship").unwrap();
         let rock = doc.scene.find("Rock").unwrap();
         let dust = doc.scene.find("Dust").unwrap();
-        assert!(doc.inside_placed_scene(dust) && !doc.inside_placed_scene(rock) && !doc.inside_placed_scene(ship));
+        assert!(
+            doc.inside_placed_scene(dust)
+                && !doc.inside_placed_scene(rock)
+                && !doc.inside_placed_scene(ship)
+        );
         assert_eq!(doc.tree_path(dust), [1, 0]);
         assert_eq!(doc.node_at(&[1, 0]), Some(dust));
         assert_eq!(doc.node_at(&[7]), None);
@@ -337,19 +440,36 @@ mod tests {
         assert_eq!(doc.scene.parent(ship_copy), Some(doc.root));
         assert_eq!(doc.scene.children(ship_copy).len(), 1);
         let rock_copy = doc.duplicate(rock).unwrap();
-        assert_eq!(doc.scene.get(rock_copy).unwrap().instance_of(), Some("scenes/rock.scene"));
-        assert_eq!(doc.scene.to_ron(doc.root).unwrap().matches("instance:").count(), 2);
+        assert_eq!(
+            doc.scene.get(rock_copy).unwrap().instance_of(),
+            Some("scenes/rock.scene")
+        );
+        assert_eq!(
+            doc.scene
+                .to_ron(doc.root)
+                .unwrap()
+                .matches("instance:")
+                .count(),
+            2
+        );
         assert_eq!(doc.duplicate(doc.root), None);
 
         let placed = doc.place_scene(doc.root, "scenes/rock.scene").unwrap();
         assert_eq!(doc.scene.get(placed).unwrap().name, "Rock");
-        assert!(doc.place_scene(doc.root, "scenes/main.scene").is_err(), "a scene cannot contain itself");
+        assert!(
+            doc.place_scene(doc.root, "scenes/main.scene").is_err(),
+            "a scene cannot contain itself"
+        );
         assert!(doc.place_scene(doc.root, "scenes/nope.scene").is_err());
 
         assert!(!doc.delete(doc.root));
         doc.selection = Some(flame);
         assert!(doc.delete(ship));
-        assert_eq!(doc.selection, Some(doc.root), "selection moves up when its node goes away");
+        assert_eq!(
+            doc.selection,
+            Some(doc.root),
+            "selection moves up when its node goes away"
+        );
         doc.commit();
         assert!(doc.undo());
         assert!(doc.scene.find("Flame").is_some());
@@ -357,9 +477,21 @@ mod tests {
 
     #[test]
     fn lists_project_files() {
-        let assets = project("files", &[("scenes/main.scene", MAIN), ("scenes/rock.scene", ROCK), ("art/ship.png", ""), ("a.jpg", ""), ("notes.txt", "")]);
+        let assets = project(
+            "files",
+            &[
+                ("scenes/main.scene", MAIN),
+                ("scenes/rock.scene", ROCK),
+                ("art/ship.png", ""),
+                ("a.jpg", ""),
+                ("notes.txt", ""),
+            ],
+        );
         let doc = Document::new(assets);
-        assert_eq!(doc.files(&["scene"]), ["scenes/main.scene", "scenes/rock.scene"]);
+        assert_eq!(
+            doc.files(&["scene"]),
+            ["scenes/main.scene", "scenes/rock.scene"]
+        );
         assert_eq!(doc.files(&["png", "jpg"]), ["a.jpg", "art/ship.png"]);
     }
 }
