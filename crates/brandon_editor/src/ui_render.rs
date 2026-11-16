@@ -1,5 +1,6 @@
 //! Turns egui's output into meshes for Brandon's renderer.
 
+use crate::glass;
 use brandon_render::{Filter, Mesh, MeshVertex, RenderError, Renderer, Texture};
 use egui::epaint::textures::TexturesDelta;
 use egui::epaint::{ImageDelta, Primitive, TextureId};
@@ -100,15 +101,21 @@ impl UiTextures {
     }
 
     /// Converts tessellated egui output into meshes. Positions stay in egui
-    /// points, which is what the editor's frame uses as its unit.
-    pub fn meshes(&self, primitives: Vec<ClippedPrimitive>) -> Vec<Mesh> {
+    /// points, which is what the editor's frame uses as its unit. Meshes
+    /// using [`glass::BACKDROP`] sample `backdrop`, the blurred scene.
+    pub fn meshes(&self, primitives: Vec<ClippedPrimitive>, backdrop: Texture) -> Vec<Mesh> {
         let mut meshes = Vec::with_capacity(primitives.len());
         for primitive in primitives {
             let Primitive::Mesh(mesh) = primitive.primitive else {
                 continue;
             };
-            let Some(texture) = self.textures.get(&mesh.texture_id) else {
-                continue;
+            let (texture, filter) = if mesh.texture_id == glass::BACKDROP {
+                (backdrop, Filter::Smooth)
+            } else {
+                match self.textures.get(&mesh.texture_id) {
+                    Some(texture) => (texture.texture, texture.filter),
+                    None => continue,
+                }
             };
             let clip = primitive.clip_rect;
             meshes.push(Mesh {
@@ -122,8 +129,8 @@ impl UiTextures {
                     })
                     .collect(),
                 indices: mesh.indices,
-                texture: texture.texture,
-                filter: texture.filter,
+                texture,
+                filter,
                 clip: Some([clip.min.x, clip.min.y, clip.width(), clip.height()]),
             });
         }

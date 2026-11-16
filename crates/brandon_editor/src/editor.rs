@@ -2,9 +2,11 @@
 //! inspector. Everything else opens on demand from the search box (Ctrl+K).
 
 use crate::document::Document;
+use crate::glass;
 use crate::inspector;
 use crate::theme;
 use crate::viewport::{self, p, v, Drag, Gfx, ViewCamera};
+use crate::widgets::{self, Icon, Tone};
 use brandon_core::Color;
 use brandon_scene::{Node, NodeId, RawBehaviour, Sprite, Text};
 use egui::{Key, KeyboardShortcut, Modifiers, Pos2, Rect, RichText, Sense, Ui};
@@ -15,6 +17,8 @@ use std::time::{Duration, Instant};
 
 /// How long a status message stays.
 const STATUS_TIME: Duration = Duration::from_secs(6);
+/// The height of the glass groups along the top.
+const TOOLBAR_HEIGHT: f32 = 40.0;
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
@@ -42,6 +46,8 @@ enum Action {
     Open(String),
     Place(String),
     Select(NodeId),
+    /// Opens the search box itself.
+    Search,
 }
 
 struct Palette {
@@ -52,6 +58,13 @@ struct Palette {
     focus: bool,
 }
 
+/// Which side of a floating panel can be dragged to resize it.
+#[derive(Clone, Copy)]
+enum Edge {
+    Left,
+    Right,
+}
+
 /// A row being dragged in the scene tree.
 #[derive(Clone, Copy)]
 struct TreeDrag(NodeId);
@@ -59,8 +72,13 @@ struct TreeDrag(NodeId);
 pub struct Editor {
     pub doc: Document,
     pub camera: ViewCamera,
-    /// Where the viewport was last frame, in points.
+    /// The part of the window no panel covers, last frame, in points. The
+    /// camera centres on it.
     pub viewport: Rect,
+    /// The whole window, which the scene fills behind the panels.
+    pub canvas: Rect,
+    tree_width: f32,
+    inspector_width: f32,
     /// The size of the game's window, drawn as an outline in the viewport.
     pub screen: Vec2,
     project: PathBuf,
@@ -84,6 +102,9 @@ impl Editor {
             doc,
             camera: ViewCamera::default(),
             viewport: Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0)),
+            canvas: Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0)),
+            tree_width: 270.0,
+            inspector_width: 320.0,
             screen: Vec2::new(1280.0, 720.0),
             project,
             drag: Drag::None,
@@ -341,6 +362,7 @@ impl Editor {
             Action::FrameAll => self.frame_all = true,
             Action::Open(path) => self.open(&path),
             Action::Place(path) => self.place(&path),
+            Action::Search => self.open_palette(false),
             Action::Select(id) => {
                 self.doc.selection = Some(id);
                 self.frame_selection(gfx);
@@ -378,33 +400,63 @@ impl Editor {
     pub fn ui(&mut self, ui: &mut Ui, gfx: &mut Gfx) {
         self.poll_game();
         self.shortcuts(ui, gfx);
-        self.top_bar(ui);
-        self.status_bar(ui);
-        egui::Panel::left("tree")
-            .default_size(240.0)
-            .size_range(160.0..=480.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(8, 10)),
-            )
-            .show(ui, |ui| self.tree_panel(ui));
-        egui::Panel::right("inspector")
-            .default_size(300.0)
-            .size_range(220.0..=520.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(12, 10)),
-            )
-            .show(ui, |ui| self.inspector_panel(ui));
-        egui::CentralPanel::no_frame().show(ui, |ui| self.viewport_panel(ui, gfx));
-        self.palette_window(ui.ctx(), gfx);
+        let ctx = ui.ctx().clone();
+        let screen = ctx.content_rect();
+        let gap = theme::GAP;
+        self.tree_width = self
+            .tree_width
+            .clamp(200.0, (screen.width() * 0.3).max(200.0));
+        self.inspector_width = self
+            .inspector_width
+            .clamp(260.0, (screen.width() * 0.35).max(260.0));
+        let tree = Rect::from_min_size(
+            screen.min + egui::vec2(gap, gap),
+            egui::vec2(self.tree_width, screen.height() - gap * 2.0),
+        );
+        let inspector = Rect::from_min_size(
+            Pos2::new(
+                screen.right() - gap - self.inspector_width,
+                screen.top() + gap,
+            ),
+            egui::vec2(self.inspector_width, screen.height() - gap * 2.0),
+        );
+        // The part of the window no panel covers: the camera centres on it.
+        let free = Rect::from_min_max(
+            Pos2::new(tree.right(), screen.top() + gap + TOOLBAR_HEIGHT),
+            Pos2::new(inspector.left(), screen.bottom()),
+        );
+        self.canvas = screen;
+        self.viewport = free;
+
+        // The scene fills the window; everything else floats over it.
+        egui::Area::new(egui::Id::unique("viewport"))
+            .order(egui::Order::Background)
+            .fixed_pos(screen.min)
+            .constrain(false)
+            .show(&ctx, |ui| {
+                ui.set_min_size(screen.size());
+                self.viewport_panel(ui, gfx);
+            });
+        self.floating_panel(&ctx, "tree", tree, Edge::Right, |editor, ui| {
+            editor.tree_panel(ui)
+        });
+        self.floating_panel(&ctx, "inspector", inspector, Edge::Left, |editor, ui| {
+            editor.inspector_panel(ui)
+        });
+        self.toolbar(
+            &ctx,
+            Rect::from_min_max(
+                Pos2::new(tree.right() + gap, screen.top() + gap),
+                Pos2::new(inspector.left() - gap, screen.top() + gap + TOOLBAR_HEIGHT),
+            ),
+        );
+        self.status(&ctx, free, screen.bottom() - gap);
+        self.palette_window(&ctx, gfx);
 
         // Group everything that changed while nothing is held into one undo step.
-        let idle = !ui.ctx().egui_is_using_pointer()
-            && !ui.input(|i| i.pointer.any_down())
-            && !ui.ctx().text_edit_focused();
+        let idle = !ctx.egui_is_using_pointer()
+            && !ctx.input(|i| i.pointer.any_down())
+            && !ctx.text_edit_focused();
         if idle {
             self.flush();
         }
@@ -431,12 +483,7 @@ impl Editor {
                 }
             }
             if i.consume_shortcut(&SEARCH) || i.consume_shortcut(&SEARCH_P) {
-                self.palette = Some(Palette {
-                    query: String::new(),
-                    selected: 0,
-                    scenes_only: false,
-                    focus: true,
-                });
+                actions.push(Action::Search);
             }
             if i.consume_shortcut(&PLAY) {
                 actions.push(if self.game.is_some() {
@@ -498,183 +545,385 @@ impl Editor {
         }
     }
 
-    fn top_bar(&mut self, ui: &mut Ui) {
-        egui::Panel::top("top")
-            .exact_size(44.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG)
-                    .inner_margin(egui::Margin::symmetric(12, 8)),
-            )
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("Brandon").strong().color(theme::ACCENT));
-                    ui.add_space(10.0);
-                    let name = self
-                        .doc
-                        .path
-                        .clone()
-                        .unwrap_or_else(|| "Untitled scene".to_string());
-                    let label = if self.doc.is_dirty() || self.changed {
-                        format!("{name}  •")
-                    } else {
-                        name
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new(label).color(theme::TEXT)).frame(false),
-                        )
-                        .on_hover_text("Open another scene")
-                        .clicked()
-                    {
-                        self.refresh_files();
-                        self.palette = Some(Palette {
-                            query: String::new(),
-                            selected: 0,
-                            scenes_only: true,
-                            focus: true,
-                        });
-                    }
+    /// A glass panel floating over the scene, which can be made wider or
+    /// narrower by dragging its inner edge.
+    fn floating_panel(
+        &mut self,
+        ctx: &egui::Context,
+        name: &str,
+        rect: Rect,
+        edge: Edge,
+        add: impl FnOnce(&mut Editor, &mut Ui),
+    ) {
+        let id = egui::Id::unique(name);
+        egui::Area::new(id)
+            .order(egui::Order::Middle)
+            .fixed_pos(rect.min)
+            .constrain(false)
+            .show(ctx, |ui| {
+                // Clicks on the panel's empty parts stay with the panel.
+                ui.interact(rect, id.with("background"), Sense::click_and_drag());
+                let radius = theme::PANEL_RADIUS;
+                ui.painter()
+                    .add(theme::panel_shadow().as_shape(rect, radius));
+                ui.painter()
+                    .add(egui::epaint::RectShape::filled(rect, radius, glass::GLASS));
+                let inner = rect.shrink2(egui::vec2(10.0, 12.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                child.set_clip_rect(rect.shrink(2.0));
+                add(self, &mut child);
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let running = self.game.is_some();
-                        let (label, color) = if running {
-                            ("■  Stop", theme::DANGER)
-                        } else {
-                            ("▶  Play", theme::ROTATE)
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(label).color(color).strong())
-                                    .min_size(egui::vec2(84.0, 28.0)),
-                            )
-                            .on_hover_text("Save and run the game (F5)")
-                            .clicked()
-                        {
-                            if running {
-                                self.stop();
-                            } else {
-                                self.play();
-                            }
-                        }
-                        ui.add_space(6.0);
-                        let can_save = self.doc.path.is_some();
-                        if ui
-                            .add_enabled(can_save, egui::Button::new("Save"))
-                            .on_hover_text("Ctrl+S")
-                            .clicked()
-                        {
-                            self.save();
-                        }
-                        if ui
-                            .add_enabled(self.doc.can_redo(), egui::Button::new("↻"))
-                            .on_hover_text("Redo (Ctrl+Shift+Z)")
-                            .clicked()
-                        {
-                            self.redo();
-                        }
-                        if ui
-                            .add_enabled(
-                                self.doc.can_undo() || self.changed,
-                                egui::Button::new("↺"),
-                            )
-                            .on_hover_text("Undo (Ctrl+Z)")
-                            .clicked()
-                        {
-                            self.undo();
-                        }
-                        ui.add_space(12.0);
-                        let search = ui.add(
-                            egui::Button::new(
-                                RichText::new("Search…            Ctrl+K").color(theme::WEAK),
-                            )
-                            .min_size(egui::vec2(220.0, 28.0))
-                            .fill(theme::RAISED),
-                        );
-                        if search.clicked() {
-                            self.refresh_files();
-                            self.palette = Some(Palette {
-                                query: String::new(),
-                                selected: 0,
-                                scenes_only: false,
-                                focus: true,
-                            });
-                        }
-                    });
-                });
+                // The inner edge can be dragged to resize.
+                let x = match edge {
+                    Edge::Left => rect.left(),
+                    Edge::Right => rect.right(),
+                };
+                let handle = Rect::from_center_size(
+                    Pos2::new(x, rect.center().y),
+                    egui::vec2(10.0, rect.height() - 2.0 * radius as f32),
+                );
+                let response = ui
+                    .interact(handle, id.with("resize"), Sense::drag())
+                    .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                if response.dragged() {
+                    let delta = response.drag_delta().x;
+                    match edge {
+                        Edge::Right => self.tree_width += delta,
+                        Edge::Left => self.inspector_width -= delta,
+                    }
+                }
+                ui.allocate_rect(rect, Sense::hover());
             });
     }
 
-    fn status_bar(&mut self, ui: &mut Ui) {
-        egui::Panel::bottom("status")
-            .exact_size(26.0)
-            .frame(
+    /// One glass capsule holding a few controls, anchored at `pivot`.
+    fn glass_group<R>(
+        ctx: &egui::Context,
+        name: &str,
+        anchor: egui::Align2,
+        at: Pos2,
+        add: impl FnOnce(&mut Ui) -> R,
+    ) -> R {
+        egui::Area::new(egui::Id::unique(name))
+            .order(egui::Order::Middle)
+            .pivot(anchor)
+            .fixed_pos(at)
+            .constrain(false)
+            .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(theme::BG)
-                    .inner_margin(egui::Margin::symmetric(12, 4)),
-            )
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    if let Some((text, when, warning)) = &self.status {
-                        if when.elapsed() < STATUS_TIME {
-                            let color = if *warning { theme::WARN } else { theme::WEAK };
-                            ui.label(RichText::new(text).color(color).small());
-                        }
-                    }
-                    if self.game.is_some() {
-                        ui.label(RichText::new("● Game running").color(theme::ROTATE).small());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    .fill(glass::GLASS_CLEAR)
+                    .corner_radius(TOOLBAR_HEIGHT as u8 / 2)
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 22,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(70),
+                    })
+                    .inner_margin(egui::Margin::same(5))
+                    .show(ui, |ui| {
+                        ui.set_height(TOOLBAR_HEIGHT - 10.0);
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            add(ui)
+                        })
+                        .inner
+                    })
+                    .inner
+            })
+            .inner
+    }
+
+    fn open_palette(&mut self, scenes_only: bool) {
+        self.refresh_files();
+        self.palette = Some(Palette {
+            query: String::new(),
+            selected: 0,
+            scenes_only,
+            focus: true,
+        });
+    }
+
+    fn toolbar(&mut self, ctx: &egui::Context, rect: Rect) {
+        // Search, in the middle.
+        let search_width = (rect.width() - 260.0).clamp(160.0, 340.0);
+        let clicked = Self::glass_group(
+            ctx,
+            "search",
+            egui::Align2::CENTER_TOP,
+            Pos2::new(rect.center().x - 60.0, rect.top()),
+            |ui| {
+                let (row, response) = ui.allocate_exact_size(
+                    egui::vec2(search_width, TOOLBAR_HEIGHT - 10.0),
+                    Sense::click(),
+                );
+                let painter = ui.painter();
+                if response.hovered() {
+                    painter.rect_filled(row, 15.0, theme::FILL_SOFT);
+                }
+                widgets::paint_icon(
+                    painter,
+                    Icon::Search,
+                    Rect::from_center_size(
+                        Pos2::new(row.left() + 18.0, row.center().y),
+                        egui::Vec2::splat(15.0),
+                    ),
+                    theme::SECONDARY,
+                );
+                painter.text(
+                    Pos2::new(row.left() + 34.0, row.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "Search nodes, scenes and commands",
+                    egui::FontId::proportional(13.0),
+                    theme::SECONDARY,
+                );
+                painter.text(
+                    Pos2::new(row.right() - 14.0, row.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    "Ctrl K",
+                    egui::FontId::new(12.0, theme::semibold()),
+                    theme::TERTIARY,
+                );
+                response.clicked()
+            },
+        );
+        if clicked {
+            self.open_palette(false);
+        }
+
+        // History and saving, then Play, on the right.
+        let running = self.game.is_some();
+        let play = Self::glass_group(
+            ctx,
+            "play",
+            egui::Align2::RIGHT_TOP,
+            Pos2::new(rect.right(), rect.top()),
+            |ui| {
+                let (icon, label, tone, hint) = if running {
+                    (Icon::Stop, "Stop", Tone::Danger, "Stop the game (F5)")
+                } else {
+                    (
+                        Icon::Play,
+                        "Play",
+                        Tone::Primary,
+                        "Save and run the game (F5)",
+                    )
+                };
+                widgets::capsule(ui, Some(icon), label, tone, true)
+                    .on_hover_text(hint)
+                    .clicked()
+            },
+        );
+        if play {
+            if running {
+                self.stop();
+            } else {
+                self.play();
+            }
+        }
+        let can_undo = self.doc.can_undo() || self.changed;
+        let can_redo = self.doc.can_redo();
+        let can_save = self.doc.path.is_some();
+        let (undo, redo, save) = Self::glass_group(
+            ctx,
+            "history",
+            egui::Align2::RIGHT_TOP,
+            Pos2::new(rect.right() - 102.0, rect.top()),
+            |ui| {
+                let undo =
+                    widgets::icon_button(ui, Icon::Undo, 30.0, can_undo, "Undo (Ctrl+Z)").clicked();
+                let redo =
+                    widgets::icon_button(ui, Icon::Redo, 30.0, can_redo, "Redo (Ctrl+Shift+Z)")
+                        .clicked();
+                let save = widgets::capsule(ui, None, "Save", Tone::Bare, can_save)
+                    .on_hover_text("Ctrl+S")
+                    .clicked();
+                (undo, redo, save)
+            },
+        );
+        if undo {
+            self.undo();
+        }
+        if redo {
+            self.redo();
+        }
+        if save {
+            self.save();
+        }
+    }
+
+    /// A small pill at the bottom with the zoom and the cursor's position,
+    /// and the latest message above it for a few seconds.
+    fn status(&mut self, ctx: &egui::Context, free: Rect, bottom: f32) {
+        let zoom = format!("{:.0}%", self.camera.zoom * 100.0);
+        let pointer = self
+            .pointer_world
+            .map(|w| format!("{:.0}, {:.0}", w.x, w.y));
+        let screen_label = format!("{:.0} × {:.0}", self.screen.x, self.screen.y);
+        let screen = &mut self.screen;
+        let mut frame_all = false;
+        Self::glass_group(
+            ctx,
+            "status",
+            egui::Align2::CENTER_BOTTOM,
+            Pos2::new(free.center().x, bottom),
+            |ui| {
+                ui.add_space(6.0);
+                if widgets::capsule(ui, None, &zoom, Tone::Bare, true)
+                    .on_hover_text("Zoom. Click to see everything.")
+                    .clicked()
+                {
+                    frame_all = true;
+                }
+                if let Some(pointer) = &pointer {
+                    ui.label(RichText::new(pointer).color(theme::SECONDARY).size(12.0));
+                    ui.add_space(6.0);
+                }
+                let button = widgets::capsule(ui, None, &screen_label, Tone::Bare, true)
+                    .on_hover_text("The size of the game's window");
+                egui::Popup::from_toggle_button_response(&button)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
+                        ui.set_min_width(180.0);
                         ui.label(
-                            RichText::new(format!("{:.0}%", self.camera.zoom * 100.0))
-                                .color(theme::WEAK)
-                                .small(),
+                            RichText::new("Game window")
+                                .family(theme::semibold())
+                                .color(theme::SECONDARY),
                         );
-                        if let Some(world) = self.pointer_world {
-                            ui.label(
-                                RichText::new(format!("{:.0}, {:.0}", world.x, world.y))
-                                    .color(theme::WEAK)
-                                    .small(),
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut screen.x)
+                                    .speed(1.0)
+                                    .range(16.0..=8192.0)
+                                    .prefix("w  "),
                             );
-                        }
-                        ui.add_space(8.0);
-                        ui.add(
-                            egui::DragValue::new(&mut self.screen.y)
-                                .speed(1.0)
-                                .range(16.0..=8192.0)
-                                .prefix("h "),
-                        )
-                        .on_hover_text("Height of the game's window, shown as an outline");
-                        ui.add(
-                            egui::DragValue::new(&mut self.screen.x)
-                                .speed(1.0)
-                                .range(16.0..=8192.0)
-                                .prefix("w "),
-                        )
-                        .on_hover_text("Width of the game's window, shown as an outline");
-                        ui.label(RichText::new("Screen").color(theme::WEAK).small());
+                            ui.add(
+                                egui::DragValue::new(&mut screen.y)
+                                    .speed(1.0)
+                                    .range(16.0..=8192.0)
+                                    .prefix("h  "),
+                            );
+                        });
                     });
-                });
+            },
+        );
+        if frame_all {
+            self.frame_all = true;
+        }
+
+        let Some((text, when, warning)) = self.status.clone() else {
+            return;
+        };
+        let age = when.elapsed();
+        if age >= STATUS_TIME {
+            return;
+        }
+        // Fade out over the last half second.
+        let left = (STATUS_TIME - age).as_secs_f32();
+        let opacity = (left / 0.5).min(1.0);
+        ctx.request_repaint_after(Duration::from_millis(50));
+        egui::Area::new(egui::Id::unique("toast"))
+            .order(egui::Order::Middle)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(Pos2::new(free.center().x, bottom - TOOLBAR_HEIGHT - 8.0))
+            .constrain(false)
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.multiply_opacity(opacity);
+                egui::Frame::new()
+                    .fill(glass::GLASS_CLEAR)
+                    .corner_radius(17)
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 22,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(60),
+                    })
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let color = if warning { theme::WARN } else { theme::GREEN };
+                            let (dot, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 16.0), Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 3.5, color);
+                            ui.label(RichText::new(text).color(theme::TEXT).size(12.5));
+                        });
+                    });
             });
     }
 
     // --- Scene tree -----------------------------------------------------------
 
     fn tree_panel(&mut self, ui: &mut Ui) {
+        // The open scene's name, which also switches scenes.
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Scene").strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let add = egui::Button::new(RichText::new("+").size(16.0).color(theme::ACCENT))
-                    .frame(false);
-                let (_, menu) = egui::containers::menu::MenuButton::from_button(add)
-                    .ui(ui, |ui| self.add_menu_items(ui));
-                let _ = menu;
+            let name = self
+                .doc
+                .path
+                .as_deref()
+                .and_then(|p| p.rsplit('/').next())
+                .map(|n| n.trim_end_matches(".scene").to_string())
+                .unwrap_or_else(|| "Untitled".to_string());
+            let dirty = self.doc.is_dirty() || self.changed;
+            let width = ui.available_width() - 40.0;
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 40.0), Sense::click());
+            if response.hovered() {
+                ui.painter().rect_filled(rect, 12.0, theme::FILL_SOFT);
+            }
+            let painter = ui.painter();
+            painter.text(
+                Pos2::new(rect.left() + 10.0, rect.top() + 12.0),
+                egui::Align2::LEFT_CENTER,
+                "BRANDON",
+                egui::FontId::new(10.0, theme::semibold()),
+                theme::TERTIARY,
+            );
+            let title = painter.layout_no_wrap(
+                name,
+                egui::FontId::new(16.0, theme::semibold()),
+                theme::TEXT,
+            );
+            let title_width = title.size().x;
+            painter.galley(
+                Pos2::new(rect.left() + 10.0, rect.top() + 18.0),
+                title,
+                theme::TEXT,
+            );
+            let mut x = rect.left() + 10.0 + title_width + 6.0;
+            if dirty {
+                painter.circle_filled(Pos2::new(x + 3.0, rect.top() + 28.0), 3.5, theme::SECONDARY);
+                x += 10.0;
+            }
+            widgets::paint_icon(
+                painter,
+                Icon::ChevronUpDown,
+                Rect::from_center_size(
+                    Pos2::new(x + 8.0, rect.top() + 28.0),
+                    egui::Vec2::splat(13.0),
+                ),
+                theme::TERTIARY,
+            );
+            if response
+                .on_hover_text(self.doc.path.as_deref().unwrap_or("Not saved yet"))
+                .clicked()
+            {
+                self.open_palette(true);
+            }
+            let add = widgets::icon_button(ui, Icon::Plus, 30.0, true, "Add a node");
+            egui::Popup::menu(&add).show(|ui| {
+                widgets::menu_style(ui);
+                self.add_menu_items(ui)
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 let root = self.doc.root;
                 self.tree_row(ui, root, 0);
                 // Space below the tree to drop onto the root.
@@ -696,20 +945,23 @@ impl Editor {
     }
 
     fn add_menu_items(&mut self, ui: &mut Ui) {
-        ui.set_min_width(200.0);
+        ui.set_min_width(210.0);
         let parent = self.insertion_parent();
         let mut add: Option<Node> = None;
-        if ui.button("Empty node").clicked() {
-            add = Some(Node::new("Node"));
-        }
-        if ui.button("Sprite").clicked() {
-            add = Some(Node::new("Sprite").with(Sprite::rect(64.0, 64.0, Color::hex(0x5b8cff))));
-        }
-        if ui.button("Text").clicked() {
-            add = Some(Node::new("Text").with(Text::new("Text").with_size(32.0)));
-        }
-        if ui.button("Camera").clicked() {
-            add = Some(Node::new("Camera").with(brandon_scene::Camera::new()));
+        for (icon, label, make) in [
+            (Icon::Node, "Empty node", 0),
+            (Icon::Image, "Sprite", 1),
+            (Icon::Text, "Text", 2),
+            (Icon::Camera, "Camera", 3),
+        ] {
+            if widgets::menu_item(ui, Some(icon), label, "").clicked() {
+                add = Some(match make {
+                    0 => Node::new("Node"),
+                    1 => Node::new("Sprite").with(Sprite::rect(64.0, 64.0, Color::hex(0x0a84ff))),
+                    2 => Node::new("Text").with(Text::new("Text").with_size(32.0)),
+                    _ => Node::new("Camera").with(brandon_scene::Camera::new()),
+                });
+            }
         }
         if let Some(node) = add {
             self.add_node(parent, node);
@@ -722,13 +974,10 @@ impl Editor {
             .cloned()
             .collect();
         if !placeable.is_empty() {
-            ui.separator();
-            ui.label(RichText::new("Place a scene").weak().small());
+            widgets::menu_separator(ui);
+            widgets::menu_heading(ui, "Place a scene");
             for scene in placeable {
-                if ui
-                    .button(RichText::new(format!("◆ {scene}")).color(theme::PLACED))
-                    .clicked()
-                {
+                if widgets::menu_item(ui, Some(Icon::Placed), &scene, "").clicked() {
                     self.place(&scene);
                     ui.close();
                 }
@@ -800,40 +1049,21 @@ impl Editor {
         let placed = node.instance_of().is_some() && id != self.doc.root;
         let inside = self.doc.inside_placed_scene(id);
         let icon = if id == self.doc.root {
-            "▢"
-        } else if placed {
-            "◆"
-        } else if node.camera.is_some() {
-            "●"
-        } else if node.text.is_some() {
-            "T"
-        } else if node.sprite.is_some() {
-            "■"
-        } else if node.shape.is_some() {
-            "◯"
+            Icon::Scene
         } else {
-            "·"
+            inspector::node_icon(node)
         };
-        let behaviours = node.behaviour_count();
-        let hidden = !node.visible;
-        let selected = self.doc.selection == Some(id);
+        let row = TreeRow {
+            icon,
+            name,
+            placed: placed || inside,
+            hidden: !node.visible,
+            behaviours: node.behaviour_count(),
+            selected: self.doc.selection == Some(id),
+        };
 
-        let row_id = ui.make_persistent_id(("tree", id));
-        let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-            ui.ctx(),
-            row_id,
-            depth < 2 && !placed,
-        );
         let draw_row = |ui: &mut Ui, editor: &mut Editor| {
-            let mut color = if placed || inside {
-                theme::PLACED
-            } else {
-                theme::TEXT
-            };
-            if hidden {
-                color = color.gamma_multiply(0.45);
-            }
-            let response = tree_row_widget(ui, selected, icon, &name, color, behaviours);
+            let response = tree_row_widget(ui, &row);
             if response.clicked() {
                 editor.doc.selection = Some(id);
             }
@@ -852,7 +1082,7 @@ impl Editor {
                         ui.painter().hline(rect.x_range(), rect.bottom(), stroke);
                     } else {
                         ui.painter()
-                            .rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
+                            .rect_stroke(rect, 9.0, stroke, egui::StrokeKind::Inside);
                     }
                 }
                 if let Some(dragged) = response.dnd_release_payload::<TreeDrag>() {
@@ -881,16 +1111,42 @@ impl Editor {
                     }
                 }
             }
-            response.context_menu(|ui| editor.tree_context_menu(ui, id, placed, inside));
+            response.context_menu(|ui| {
+                widgets::menu_style(ui);
+                editor.tree_context_menu(ui, id, placed, inside)
+            });
         };
 
         if children.is_empty() {
             ui.horizontal(|ui| {
-                ui.add_space(ui.spacing().icon_width);
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_space(ui.spacing().indent);
                 draw_row(ui, self);
             });
         } else {
-            state.show_header(ui, |ui| draw_row(ui, self)).body(|ui| {
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                ui.make_persistent_id(("tree", id)),
+                depth < 2 && !placed,
+            );
+            let header = ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                state.show_toggle_button(ui, |ui, openness, response| {
+                    let color = if response.hovered() {
+                        theme::TEXT
+                    } else {
+                        theme::TERTIARY
+                    };
+                    widgets::paint_icon(
+                        ui.painter(),
+                        Icon::Chevron(openness),
+                        Rect::from_center_size(response.rect.center(), egui::Vec2::splat(13.0)),
+                        color,
+                    );
+                });
+                draw_row(ui, self);
+            });
+            state.show_body_indented(&header.response, ui, |ui| {
                 for child in children {
                     self.tree_row(ui, child, depth + 1);
                 }
@@ -899,6 +1155,7 @@ impl Editor {
     }
 
     fn tree_context_menu(&mut self, ui: &mut Ui, id: NodeId, placed: bool, inside: bool) {
+        ui.set_min_width(200.0);
         self.doc.selection = Some(id);
         if placed {
             if let Some(path) = self
@@ -908,39 +1165,44 @@ impl Editor {
                 .and_then(|n| n.instance_of())
                 .map(str::to_string)
             {
-                if ui.button(format!("Open {path}")).clicked() {
+                if widgets::menu_item(ui, Some(Icon::Placed), &format!("Open {path}"), "").clicked()
+                {
                     self.open(&path);
                     ui.close();
                     return;
                 }
-                ui.separator();
+                widgets::menu_separator(ui);
             }
         }
         if inside {
-            ui.label(RichText::new("Part of a placed scene").weak());
+            widgets::menu_heading(ui, "Part of a placed scene");
             return;
         }
         if !placed {
-            ui.menu_button("Add child", |ui| self.add_menu_items(ui));
+            widgets::submenu_item(ui, Some(Icon::Plus), "Add child", |ui| {
+                self.add_menu_items(ui)
+            });
         }
         if id != self.doc.root {
-            if ui.button("Duplicate          Ctrl+D").clicked() {
+            if widgets::menu_item(ui, Some(Icon::Overlay), "Duplicate", "Ctrl D").clicked() {
                 self.duplicate();
                 ui.close();
             }
             let visible = self.doc.scene.get(id).is_some_and(|n| n.visible);
-            if ui.button(if visible { "Hide" } else { "Show" }).clicked() {
+            let (icon, label) = if visible {
+                (Icon::EyeClosed, "Hide")
+            } else {
+                (Icon::Eye, "Show")
+            };
+            if widgets::menu_item(ui, Some(icon), label, "").clicked() {
                 if let Some(node) = self.doc.scene.get_mut(id) {
                     node.visible = !visible;
                     self.changed = true;
                 }
                 ui.close();
             }
-            ui.separator();
-            if ui
-                .button(RichText::new("Delete               Del").color(theme::DANGER))
-                .clicked()
-            {
+            widgets::menu_separator(ui);
+            if widgets::menu_item_danger(ui, "Delete", "Del").clicked() {
                 self.delete();
                 ui.close();
             }
@@ -951,14 +1213,22 @@ impl Editor {
 
     fn inspector_panel(&mut self, ui: &mut Ui) {
         let Some(id) = self.doc.selection.filter(|id| self.doc.scene.contains(*id)) else {
-            ui.add_space(40.0);
+            ui.add_space(ui.available_height() * 0.36);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Nothing selected").color(theme::WEAK));
-                ui.add_space(6.0);
+                let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(40.0), Sense::hover());
+                widgets::paint_icon(ui.painter(), Icon::Scene, rect, theme::TERTIARY);
+                ui.add_space(10.0);
                 ui.label(
-                    RichText::new("Click something in the viewport\nor the scene tree.")
-                        .color(theme::WEAK)
-                        .small(),
+                    RichText::new("No Selection")
+                        .family(theme::semibold())
+                        .size(17.0)
+                        .color(theme::SECONDARY),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Click something in the scene\nor in the list on the left.")
+                        .color(theme::TERTIARY)
+                        .size(12.5),
                 );
             });
             return;
@@ -970,6 +1240,7 @@ impl Editor {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 4.0);
                 if let Some(node) = self.doc.scene.get_mut(id) {
                     let cx = inspector::Context {
                         images: &images,
@@ -994,17 +1265,19 @@ impl Editor {
     // --- Viewport -------------------------------------------------------------
 
     fn viewport_panel(&mut self, ui: &mut Ui, gfx: &mut Gfx) {
-        let rect = ui.max_rect();
-        self.viewport = rect;
+        // The scene reaches under the panels, but the camera centres on the
+        // part they leave free.
+        let rect = self.canvas;
+        let free = self.viewport;
         if self.frame_all {
             self.frame_all = false;
             match viewport::scene_extent(&self.doc.scene, self.doc.root, gfx, &self.doc.assets) {
                 Some((min, max)) => {
                     let min = min.min(Vec2::ZERO);
                     let max = max.max(self.screen);
-                    self.camera.frame(rect, min, max);
+                    self.camera.frame(free, min, max);
                 }
-                None => self.camera.frame(rect, Vec2::ZERO, self.screen),
+                None => self.camera.frame(free, Vec2::ZERO, self.screen),
             }
         }
         let response = ui.interact(
@@ -1022,7 +1295,7 @@ impl Editor {
             let pinch = ui.input(|i| i.zoom_delta());
             let factor = (scroll * 0.0018).exp() * pinch;
             if (factor - 1.0).abs() > 1e-4 {
-                self.camera.zoom_at(rect, hover, factor);
+                self.camera.zoom_at(free, hover, factor);
             }
         }
 
@@ -1249,17 +1522,17 @@ impl Editor {
                 egui::Align2::LEFT_TOP,
                 "0, 0",
                 egui::FontId::proportional(10.5),
-                theme::WEAK.gamma_multiply(0.7),
+                theme::TERTIARY,
             );
         }
 
         if self.doc.scene.children(self.doc.root).is_empty() {
             painter.text(
-                rect.center(),
+                free.center(),
                 egui::Align2::CENTER_CENTER,
-                "An empty scene. Add something with + in the scene tree,\nor press Ctrl+K to open a scene.",
+                "An empty scene. Add something with + in the scene list,\nor press Ctrl+K to open a scene.",
                 egui::FontId::proportional(14.0),
-                theme::WEAK,
+                theme::SECONDARY,
             );
         }
     }
@@ -1342,35 +1615,49 @@ impl Editor {
         // Anchored near the top, so the box stays put while the list shrinks.
         let id = egui::Id::unique("brandon-search");
         let area = egui::Modal::default_area(id.with("area"))
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0));
-        let modal = egui::Modal::new(id).area(area).frame(
-            egui::Frame::new()
-                .fill(theme::PANEL)
-                .stroke(egui::Stroke::new(1.0, theme::LINE))
-                .corner_radius(12)
-                .inner_margin(egui::Margin::same(10)),
-        );
-        let response = modal.show(ctx, |ui| {
-            ui.set_width(520.0);
-            let hint = if palette.scenes_only {
-                "Open a scene…"
-            } else {
-                "Search nodes, scenes and commands…"
-            };
-            let edit = ui.add(
-                egui::TextEdit::singleline(&mut palette.query)
-                    .hint_text(hint)
-                    .desired_width(f32::INFINITY)
-                    .font(egui::FontId::proportional(16.0))
-                    .margin(egui::Margin::symmetric(8, 6)),
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 96.0));
+        let modal = egui::Modal::new(id)
+            .area(area)
+            .backdrop_color(egui::Color32::from_black_alpha(70))
+            .frame(
+                egui::Frame::new()
+                    .fill(glass::GLASS)
+                    .corner_radius(22)
+                    .shadow(theme::panel_shadow())
+                    .inner_margin(egui::Margin::same(8)),
             );
-            if palette.focus {
-                edit.request_focus();
-                palette.focus = false;
-            }
-            if edit.changed() {
-                palette.selected = 0;
-            }
+        let response = modal.show(ctx, |ui| {
+            ui.set_width(560.0);
+            let hint = if palette.scenes_only {
+                "Open a scene"
+            } else {
+                "Search nodes, scenes and commands"
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let (icon, _) = ui.allocate_exact_size(egui::vec2(34.0, 38.0), Sense::hover());
+                widgets::paint_icon(
+                    ui.painter(),
+                    Icon::Search,
+                    Rect::from_center_size(icon.center(), egui::Vec2::splat(18.0)),
+                    theme::SECONDARY,
+                );
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut palette.query)
+                        .hint_text(RichText::new(hint).color(theme::TERTIARY))
+                        .frame(egui::Frame::NONE)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::FontId::proportional(18.0))
+                        .margin(egui::Margin::symmetric(0, 8)),
+                );
+                if palette.focus {
+                    edit.request_focus();
+                    palette.focus = false;
+                }
+                if edit.changed() {
+                    palette.selected = 0;
+                }
+            });
             ui.input_mut(|i| {
                 if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
                     palette.selected = (palette.selected + 1).min(matches.len().saturating_sub(1));
@@ -1385,33 +1672,30 @@ impl Editor {
                     close = true;
                 }
             });
-            ui.add_space(6.0);
+            let line = ui.available_rect_before_wrap();
+            ui.painter().hline(
+                (line.left() - 8.0)..=(line.right() + 8.0),
+                line.top() + 2.0,
+                egui::Stroke::new(1.0, theme::SEPARATOR),
+            );
+            ui.add_space(8.0);
             if matches.is_empty() {
-                ui.label(RichText::new("Nothing matches").color(theme::WEAK));
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No Results").color(theme::SECONDARY));
+                });
+                ui.add_space(12.0);
+                return;
             }
             egui::ScrollArea::vertical()
-                .max_height(360.0)
+                .max_height(380.0)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     for (index, (action, label, kind)) in matches.iter().enumerate() {
                         let selected = index == palette.selected;
-                        let mut job = egui::text::LayoutJob::default();
-                        let color = if matches!(action, Action::Place(_)) {
-                            theme::PLACED
-                        } else {
-                            theme::TEXT
-                        };
-                        job.append(
-                            label,
-                            0.0,
-                            egui::TextFormat::simple(egui::FontId::proportional(14.0), color),
-                        );
-                        let row = ui.add(
-                            egui::Button::selectable(selected, job)
-                                .frame_when_inactive(false)
-                                .right_text(RichText::new(*kind).color(theme::WEAK).small())
-                                .min_size(egui::vec2(ui.available_width(), 28.0)),
-                        );
-                        if selected {
+                        let row = palette_row(ui, action_icon(action), label, kind, selected);
+                        if selected && row.rect.height() > 0.0 {
                             row.scroll_to_me(None);
                         }
                         if row.clicked() {
@@ -1431,72 +1715,166 @@ impl Editor {
     }
 }
 
+/// The icon beside a search result.
+fn action_icon(action: &Action) -> Icon {
+    match action {
+        Action::Save => Icon::Save,
+        Action::Undo => Icon::Undo,
+        Action::Redo => Icon::Redo,
+        Action::Play => Icon::Play,
+        Action::Stop => Icon::Stop,
+        Action::AddNode => Icon::Plus,
+        Action::Duplicate => Icon::Overlay,
+        Action::Delete => Icon::Close,
+        Action::FrameSelection | Action::FrameAll => Icon::Frame,
+        Action::Open(_) => Icon::Scene,
+        Action::Place(_) => Icon::Placed,
+        Action::Select(_) => Icon::Node,
+        Action::Search => Icon::Search,
+    }
+}
+
+/// One search result: an icon in a small tile, the label, and what kind of
+/// thing it is on the right. The chosen row is filled with the accent colour.
+fn palette_row(ui: &mut Ui, icon: Icon, label: &str, kind: &str, selected: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 12.0, theme::ACCENT);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 12.0, theme::FILL_SOFT);
+    }
+    let tile = Rect::from_center_size(
+        Pos2::new(rect.left() + 20.0, rect.center().y),
+        egui::Vec2::splat(24.0),
+    );
+    let (tile_fill, icon_color) = if selected {
+        (egui::Color32::from_white_alpha(46), egui::Color32::WHITE)
+    } else if icon == Icon::Placed {
+        (theme::PLACED.gamma_multiply(0.22), theme::PLACED)
+    } else {
+        (theme::FILL_SOFT, theme::TEXT)
+    };
+    painter.rect_filled(tile, 7.0, tile_fill);
+    widgets::paint_icon(painter, icon, tile.shrink(5.0), icon_color);
+    let text = if selected {
+        egui::Color32::WHITE
+    } else {
+        theme::TEXT
+    };
+    painter.text(
+        Pos2::new(rect.left() + 42.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        text,
+    );
+    painter.text(
+        Pos2::new(rect.right() - 12.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        kind,
+        egui::FontId::proportional(12.0),
+        if selected {
+            egui::Color32::from_white_alpha(190)
+        } else {
+            theme::TERTIARY
+        },
+    );
+    response
+}
+
+/// What one row of the scene tree shows.
+struct TreeRow {
+    icon: Icon,
+    name: String,
+    /// Part of, or the root of, a scene placed from another file.
+    placed: bool,
+    hidden: bool,
+    behaviours: usize,
+    selected: bool,
+}
+
 /// One row of the scene tree: an icon, the name, and a small count of
 /// behaviours. Painted by hand so it lines up exactly.
-fn tree_row_widget(
-    ui: &mut Ui,
-    selected: bool,
-    icon: &str,
-    name: &str,
-    color: egui::Color32,
-    behaviours: usize,
-) -> egui::Response {
-    let height = 24.0;
+fn tree_row_widget(ui: &mut Ui, row: &TreeRow) -> egui::Response {
+    let height = 28.0;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         Sense::click_and_drag(),
     );
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        let fill = if selected {
-            Some(theme::ACCENT_DIM)
+        if row.selected {
+            painter.rect_filled(rect, 9.0, theme::ACCENT);
         } else if response.hovered() {
-            Some(theme::RAISED)
-        } else {
-            None
-        };
-        if let Some(fill) = fill {
-            painter.rect_filled(rect, 5.0, fill);
+            painter.rect_filled(rect, 9.0, theme::FILL_SOFT);
         }
-        let font = egui::FontId::proportional(13.5);
-        let icon_pos = egui::pos2(rect.left() + 12.0, rect.center().y);
-        painter.text(
-            icon_pos,
-            egui::Align2::CENTER_CENTER,
-            icon,
-            egui::FontId::proportional(11.0),
-            color.gamma_multiply(0.75),
+        let dim = |c: egui::Color32| {
+            if row.hidden {
+                c.gamma_multiply(0.45)
+            } else {
+                c
+            }
+        };
+        let (icon_color, text_color) = if row.selected {
+            (egui::Color32::WHITE, egui::Color32::WHITE)
+        } else if row.placed {
+            (dim(theme::PLACED), dim(theme::TEXT))
+        } else {
+            (dim(theme::ACCENT), dim(theme::TEXT))
+        };
+        widgets::paint_icon(
+            painter,
+            row.icon,
+            Rect::from_center_size(
+                Pos2::new(rect.left() + 14.0, rect.center().y),
+                egui::Vec2::splat(15.0),
+            ),
+            icon_color,
         );
-        let text_left = rect.left() + 24.0;
-        let galley = painter.layout_no_wrap(name.to_string(), font, color);
-        let pill_room = if behaviours > 0 { 30.0 } else { 0.0 };
-        let max_width = (rect.right() - text_left - pill_room - 4.0).max(10.0);
-        let clip = egui::Rect::from_min_max(
-            egui::pos2(text_left, rect.top()),
-            egui::pos2(text_left + max_width, rect.bottom()),
+        let text_left = rect.left() + 30.0;
+        let galley = painter.layout_no_wrap(
+            row.name.clone(),
+            egui::FontId::proportional(13.0),
+            text_color,
         );
-        painter.with_clip_rect(clip).galley(
-            egui::pos2(text_left, rect.center().y - galley.size().y / 2.0),
-            galley.clone(),
-            color,
+        let pill_room = if row.behaviours > 0 { 30.0 } else { 0.0 };
+        let max_width = (rect.right() - text_left - pill_room - 6.0).max(10.0);
+        let clip = Rect::from_min_max(
+            Pos2::new(text_left, rect.top()),
+            Pos2::new(text_left + max_width, rect.bottom()),
         );
-        if behaviours > 0 {
-            let x = (text_left + galley.size().x + 8.0).min(rect.right() - pill_room);
-            let pill = egui::Rect::from_min_size(
-                egui::pos2(x, rect.center().y - 8.0),
-                egui::vec2(22.0, 16.0),
+        painter
+            .with_clip_rect(clip.intersect(painter.clip_rect()))
+            .galley(
+                Pos2::new(text_left, rect.center().y - galley.size().y / 2.0),
+                galley.clone(),
+                text_color,
             );
-            painter.rect_filled(pill, 8.0, theme::HOVER);
+        if row.behaviours > 0 {
+            let x = (text_left + galley.size().x + 8.0).min(rect.right() - pill_room);
+            let pill =
+                Rect::from_min_size(Pos2::new(x, rect.center().y - 8.0), egui::vec2(22.0, 16.0));
+            let (fill, color) = if row.selected {
+                (egui::Color32::from_white_alpha(56), egui::Color32::WHITE)
+            } else {
+                (theme::FILL, theme::SECONDARY)
+            };
+            painter.rect_filled(pill, 8.0, fill);
             painter.text(
                 pill.center(),
                 egui::Align2::CENTER_CENTER,
-                behaviours.to_string(),
-                egui::FontId::proportional(10.5),
-                theme::WEAK,
+                row.behaviours.to_string(),
+                egui::FontId::new(10.5, theme::semibold()),
+                color,
             );
         }
     }
-    match behaviours {
+    match row.behaviours {
         0 => response,
         1 => response.on_hover_text("1 behaviour"),
         n => response.on_hover_text(format!("{n} behaviours")),
