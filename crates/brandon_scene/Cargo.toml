@@ -1,0 +1,20 @@
+[package]
+name = "brandon_scene"
+description = "The Brandon scene model: nodes, parts, behaviours and scene files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+brandon_core.workspace = true
+glam.workspace = true
+serde.workspace = true
+ron.workspace = true
+erased-serde.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "starfall"
+description = "A small Brandon demo game: catch the stars, dodge the rocks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+brandon.workspace = true

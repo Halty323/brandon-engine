@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "examples/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/Halty323/brandon-engine"
+rust-version = "1.86"
+
+[workspace.dependencies]
+brandon = { path = "crates/brandon" }
+brandon_core = { path = "crates/brandon_core" }
+brandon_scene = { path = "crates/brandon_scene" }
+brandon_render = { path = "crates/brandon_render" }
+brandon_macros = { path = "crates/brandon_macros" }
+
+glam = { version = "0.30", features = ["serde", "bytemuck"] }
+serde = { version = "1", features = ["derive"] }
+ron = "0.10"
+erased-serde = "0.4"
+log = "0.4"
+thiserror = "2"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+winit = "0.30"
+ash = "0.38"
+ash-window = "0.13"
+raw-window-handle = "0.6"
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+naga = { version = "24", features = ["wgsl-in", "spv-out"] }
+cosmic-text = "0.14"
+env_logger = "0.11"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

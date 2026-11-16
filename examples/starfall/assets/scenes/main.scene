@@ -1,0 +1,71 @@
+// Starfall's one and only level. Open it in a text editor and change things:
+// the numbers under `behaviours` are the game's tuning knobs.
+(
+    name: "Main",
+    behaviours: {
+        "Round": (lives: 3),
+    },
+    children: [
+        (
+            name: "Backdrop",
+            transform: (z: -10),
+            behaviours: {
+                "Starfield": (count: 90),
+            },
+        ),
+        (
+            name: "Spawner",
+            behaviours: {
+                "Spawner": (interval: 0.7, rock_chance: 0.35),
+            },
+        ),
+        (
+            name: "Ship",
+            transform: (position: (480, 450), z: 5),
+            sprite: (texture: "ship.png"),
+            shape: Circle(radius: 22),
+            behaviours: {
+                "Ship": (speed: 460),
+            },
+            children: [
+                (
+                    name: "Flame",
+                    transform: (position: (0, 28), z: -1),
+                    sprite: (texture: "flame.png", anchor: (0.5, 0)),
+                    behaviours: {
+                        "Flicker": (),
+                    },
+                ),
+            ],
+        ),
+        (
+            name: "Hud",
+            overlay: (),
+            children: [
+                (
+                    name: "Score",
+                    transform: (position: (24, 16)),
+                    text: (text: "Stars 0", size: 28),
+                ),
+                (
+                    name: "Lives",
+                    transform: (position: (936, 16)),
+                    text: (text: "Lives 3", size: 28, align: Right),
+                ),
+                (
+                    name: "Message",
+                    visible: false,
+                    transform: (position: (480, 200)),
+                    text: (text: "Game over", size: 64, align: Center),
+                    children: [
+                        (
+                            name: "Hint",
+                            transform: (position: (0, 90)),
+                            text: (text: "Press Enter to play again", size: 24, color: "#9aa4c0", align: Center),
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    ],
+)

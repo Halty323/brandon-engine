@@ -1,0 +1,8 @@
+(
+    name: "Rock",
+    sprite: (texture: "rock.png"),
+    shape: Circle(radius: 24),
+    behaviours: {
+        "Falling": (speed: 250, spin: -0.8, kind: Rock),
+    },
+)

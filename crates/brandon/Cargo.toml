@@ -1,0 +1,21 @@
+[package]
+name = "brandon"
+description = "Brandon: a 2D game engine that is easy to learn and capable of beautiful graphics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+brandon_core.workspace = true
+brandon_scene.workspace = true
+brandon_render.workspace = true
+brandon_macros.workspace = true
+glam.workspace = true
+serde.workspace = true
+log.workspace = true
+thiserror.workspace = true
+image.workspace = true
+winit.workspace = true
+env_logger.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "brandon_editor"
+description = "The Brandon editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+brandon.workspace = true
+brandon_core.workspace = true
+brandon_scene.workspace = true
+brandon_render.workspace = true
+glam.workspace = true
+ron.workspace = true
+log.workspace = true
+winit.workspace = true
+image.workspace = true
+env_logger.workspace = true
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.37", default-features = false, features = ["x11", "wayland"] }
+
+[[bin]]
+name = "brandon-editor"
+path = "src/main.rs"
