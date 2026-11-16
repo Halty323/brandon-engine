@@ -12,14 +12,16 @@
 mod document;
 mod editor;
 mod fields;
+mod glass;
 mod inspector;
 mod theme;
 mod ui_render;
 mod viewport;
+mod widgets;
 
 use brandon::draw::{build_frame, Textures};
 use brandon_core::{Assets, Color};
-use brandon_render::{Renderer, TextRenderer};
+use brandon_render::{Renderer, TextRenderer, Texture};
 use document::Document;
 use editor::Editor;
 use std::path::PathBuf;
@@ -38,6 +40,9 @@ struct Graphics {
     text: TextRenderer,
     textures: Textures,
     ui_textures: UiTextures,
+    /// The soft coloured backdrop behind the scene, which the glass panels
+    /// pick up colour from.
+    wallpaper: Texture,
     egui_state: egui_winit::State,
     window: Arc<Window>,
 }
@@ -161,8 +166,14 @@ impl App {
                 .map_err(|e| e.to_string())?,
         );
         let size = window.inner_size();
-        let renderer =
+        let mut renderer =
             Renderer::new(window.clone(), size.width, size.height).map_err(|e| e.to_string())?;
+        // Small and smooth: it is stretched over the window and only holds
+        // gentle gradients.
+        let (w, h) = (192, 120);
+        let wallpaper = renderer
+            .create_texture(w, h, &viewport::wallpaper_image(w, h))
+            .map_err(|e| e.to_string())?;
         let egui_state = egui_winit::State::new(
             self.egui.clone(),
             egui::ViewportId::ROOT,
@@ -176,6 +187,7 @@ impl App {
             text: TextRenderer::new(),
             textures: Textures::new(),
             ui_textures: UiTextures::default(),
+            wallpaper,
             egui_state,
             window,
         });
@@ -210,18 +222,24 @@ impl App {
         .map_err(|e| e.to_string())?;
         let grid = viewport::grid_layer(
             &editor.camera,
-            editor.viewport,
+            editor.canvas,
             view,
             editor.screen,
             &g.renderer,
         );
         frame.layers.insert(0, grid);
+        frame
+            .layers
+            .insert(0, viewport::wallpaper_layer(g.wallpaper, points));
 
         g.ui_textures
             .update(&mut g.renderer, textures_delta)
             .map_err(|e| e.to_string())?;
+        // Panels marked as glass become blurred, lit glass over the scene.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(points.x, points.y));
+        let shapes = glass::apply(shapes, screen, 1.0 / ppp);
         let primitives = egui.tessellate(shapes, ppp);
-        frame.ui = g.ui_textures.meshes(primitives);
+        frame.ui = g.ui_textures.meshes(primitives, g.renderer.backdrop());
         if capturing {
             g.renderer.request_capture();
         }

@@ -85,8 +85,9 @@ Principles:
 - **Search everything from one shortcut:** nodes, scenes and commands today; assets and settings *(planned)*.
 - **Keyboard-first**, with sensible defaults and nothing to configure before the first run.
 - Calm visual design: few colours, clear typography, no clutter. The JetBrains IDEs are a reference for how to stay powerful while showing little, but Brandon has its own look.
+- **The scene fills the window.** The tree, the inspector and the toolbar float over it as panels of frosted glass, in the spirit of Apple's Liquid Glass: the renderer blurs what lies behind each panel, bends it slightly at the rim like a lens and lights the edge. Controls are capsules, switches and segmented controls with drawn icons, in a dark palette with one accent colour. The camera centres on the part of the window the panels leave free, and panels can be made wider or narrower from their inner edge.
 
-Technology: the editor is a Rust app built on the same engine crates, so the viewport is the real renderer. Its UI is `egui` with Brandon's own theme, drawn by Brandon's renderer (see open question 2).
+Technology: the editor is a Rust app built on the same engine crates, so the viewport is the real renderer. Its UI is `egui` with Brandon's own theme and widgets, drawn by Brandon's renderer (see open question 2). The renderer draws a frame with UI in three steps: the scene into an offscreen image, a blurred copy of it for glass to sample, then the UI over it with blending in gamma space, as design tools do. Games, which have no editor UI, are drawn directly as before.
 
 The editor does not load the game's code. Behaviours it has no code for are kept as their scene-file data, so it can open, change and save any game's scenes. Their settings are edited as that data: numbers, true/false and text get proper fields, anything else is edited as text. Once hot reload exists, the editor can show the real Rust types instead.
 

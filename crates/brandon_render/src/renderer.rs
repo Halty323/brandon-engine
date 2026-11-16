@@ -1,4 +1,4 @@
-use crate::shader::{compile_wgsl, MESH_WGSL, QUAD_WGSL};
+use crate::shader::{compile_wgsl, FULLSCREEN_WGSL, MESH_WGSL, QUAD_WGSL};
 use crate::{Filter, Frame, MeshVertex, RenderError};
 use ash::{ext, khr, vk};
 use brandon_core::ImageData;
@@ -19,6 +19,21 @@ const SETS_PER_POOL: u32 = 256;
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 static VALIDATION_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// The texture index that stands for the blurred backdrop.
+const BACKDROP_INDEX: u32 = u32::MAX - 1;
+/// How many times the backdrop is halved in size while blurring. Each step
+/// roughly doubles how far the blur reaches.
+const BLUR_LEVELS: usize = 4;
+/// How much more vivid the backdrop's colours are than the scene's.
+const BACKDROP_SATURATION: f32 = 1.5;
+/// Frames with a user interface draw their layers into an image of this
+/// format first. Every Vulkan device can draw into it and read it back.
+const OFFSCREEN_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+/// The user interface is drawn into an image of this format. It stores
+/// sRGB values as they are, so translucent UI colours blend in gamma space,
+/// which is what designers and UI toolkits expect.
+const UI_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 
 /// A texture on the graphics card. Cheap to copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -97,6 +112,79 @@ struct GrowBuffer {
     capacity: usize,
 }
 
+/// An image the renderer draws into and then reads from.
+struct Target {
+    image: vk::Image,
+    view: vk::ImageView,
+    allocation: Allocation,
+    set: vk::DescriptorSet,
+    width: u32,
+    height: u32,
+}
+
+impl Target {
+    fn extent(&self) -> vk::Extent2D {
+        vk::Extent2D {
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+/// The images used for frames with a user interface.
+struct Offscreen {
+    /// The layers, drawn at full size.
+    scene: Target,
+    /// The layers again with the UI on top, in gamma space.
+    ui: Target,
+    /// Ever smaller copies of the scene, for blurring. After blurring, the
+    /// first holds the backdrop.
+    levels: Vec<Target>,
+    extent: vk::Extent2D,
+}
+
+/// Push constants for [`FULLSCREEN_WGSL`].
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FullscreenParams {
+    texel: [f32; 2],
+    spread: f32,
+    mode: u32,
+    saturation: f32,
+    _padding: f32,
+}
+
+impl FullscreenParams {
+    fn new(source: Option<&Target>, spread: f32, mode: u32) -> Self {
+        let texel = source.map_or([0.0; 2], |t| [1.0 / t.width as f32, 1.0 / t.height as f32]);
+        FullscreenParams {
+            texel,
+            spread,
+            mode,
+            saturation: 1.0,
+            _padding: 0.0,
+        }
+    }
+
+    fn shrink(source: &Target) -> Self {
+        Self::new(Some(source), 1.0, 0)
+    }
+
+    fn grow(source: &Target) -> Self {
+        Self::new(Some(source), 1.0, 1)
+    }
+
+    /// Copies a linear image into a gamma-space one.
+    fn encode() -> Self {
+        Self::new(None, 0.0, 3)
+    }
+
+    /// Copies a gamma-space image into a linear one.
+    fn decode() -> Self {
+        Self::new(None, 0.0, 4)
+    }
+}
+
 /// One UI mesh, ready to draw.
 struct MeshDraw {
     texture: u32,
@@ -150,7 +238,18 @@ pub struct Renderer {
     texture_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// Draws quads into the offscreen scene image.
+    offscreen_pipeline: vk::Pipeline,
+    /// Draws UI meshes into the offscreen UI image.
     mesh_pipeline: vk::Pipeline,
+    fullscreen_layout: vk::PipelineLayout,
+    /// Full-window passes into offscreen images, the UI image and the window.
+    blur_pipeline: vk::Pipeline,
+    compose_pipeline: vk::Pipeline,
+    present_pipeline: vk::Pipeline,
+    offscreen: Option<Offscreen>,
+    /// Descriptor sets for the offscreen images, kept across resizes.
+    offscreen_sets: Vec<vk::DescriptorSet>,
     samplers: [vk::Sampler; 2],
     sampler_sets: [vk::DescriptorSet; 2],
     descriptor_pools: Vec<vk::DescriptorPool>,
@@ -403,6 +502,18 @@ impl Renderer {
                 )
                 .map_err(vk_err("creating the pipeline layout"))?;
 
+            let fullscreen_layout = device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&[sampler_layout, texture_layout])
+                        .push_constant_ranges(&[vk::PushConstantRange::default()
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                            .offset(0)
+                            .size(std::mem::size_of::<FullscreenParams>() as u32)]),
+                    None,
+                )
+                .map_err(vk_err("creating the pipeline layout"))?;
+
             let make_sampler = |filter: vk::Filter| {
                 device.create_sampler(
                     &vk::SamplerCreateInfo::default()
@@ -430,7 +541,15 @@ impl Renderer {
                 vk::SwapchainKHR::null(),
             )?;
             let pipeline = create_quad_pipeline(&device, pipeline_layout, swapchain.format)?;
-            let mesh_pipeline = create_mesh_pipeline(&device, pipeline_layout, swapchain.format)?;
+            let offscreen_pipeline =
+                create_quad_pipeline(&device, pipeline_layout, OFFSCREEN_FORMAT)?;
+            let mesh_pipeline = create_mesh_pipeline(&device, pipeline_layout, UI_FORMAT)?;
+            let blur_pipeline =
+                create_fullscreen_pipeline(&device, fullscreen_layout, OFFSCREEN_FORMAT)?;
+            let compose_pipeline =
+                create_fullscreen_pipeline(&device, fullscreen_layout, UI_FORMAT)?;
+            let present_pipeline =
+                create_fullscreen_pipeline(&device, fullscreen_layout, swapchain.format)?;
 
             let mut renderer = Renderer {
                 entry,
@@ -452,7 +571,14 @@ impl Renderer {
                 texture_layout,
                 pipeline_layout,
                 pipeline,
+                offscreen_pipeline,
                 mesh_pipeline,
+                fullscreen_layout,
+                blur_pipeline,
+                compose_pipeline,
+                present_pipeline,
+                offscreen: None,
+                offscreen_sets: Vec::new(),
                 samplers,
                 sampler_sets: [vk::DescriptorSet::null(); 2],
                 descriptor_pools: Vec::new(),
@@ -926,6 +1052,9 @@ impl Renderer {
             },
         );
         let old_format = old.format;
+        if let Some(offscreen) = self.offscreen.take() {
+            self.destroy_offscreen(offscreen);
+        }
         for view in &old.views {
             self.device.destroy_image_view(*view, None);
         }
@@ -945,11 +1074,14 @@ impl Renderer {
         self.swapchain = created?;
         if self.swapchain.format != old_format && self.swapchain.format != vk::Format::UNDEFINED {
             self.device.destroy_pipeline(self.pipeline, None);
-            self.device.destroy_pipeline(self.mesh_pipeline, None);
+            self.device.destroy_pipeline(self.present_pipeline, None);
             self.pipeline =
                 create_quad_pipeline(&self.device, self.pipeline_layout, self.swapchain.format)?;
-            self.mesh_pipeline =
-                create_mesh_pipeline(&self.device, self.pipeline_layout, self.swapchain.format)?;
+            self.present_pipeline = create_fullscreen_pipeline(
+                &self.device,
+                self.fullscreen_layout,
+                self.swapchain.format,
+            )?;
         }
         self.needs_recreate = false;
         Ok(())
@@ -1016,6 +1148,9 @@ impl Renderer {
                     .copy_from_slice(bytes);
             }
 
+            if !frame.ui.is_empty() {
+                self.ensure_offscreen()?;
+            }
             let (mesh_vertices, mesh_indices, meshes) = self.build_meshes(frame);
             let mut grow = std::mem::take(&mut self.frames[slot].mesh_vertices);
             let filled = self.fill(
@@ -1164,10 +1299,11 @@ impl Renderer {
         let size = frame.size.max(glam::Vec2::ONE);
         let pixels = glam::Vec2::new(extent.width as f32, extent.height as f32) / size;
         for mesh in &frame.ui {
-            let live = self
-                .textures
-                .get(mesh.texture.index as usize)
-                .is_some_and(Option::is_some);
+            let live = mesh.texture.index == BACKDROP_INDEX
+                || self
+                    .textures
+                    .get(mesh.texture.index as usize)
+                    .is_some_and(Option::is_some);
             if !live || mesh.indices.is_empty() {
                 continue;
             }
@@ -1303,6 +1439,10 @@ impl Renderer {
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
+        let [r, g, b, _] = frame.clear.to_linear();
+        let clear = [r, g, b, 1.0];
+        let offscreen = self.offscreen.as_ref().filter(|_| !meshes.is_empty());
+
         self.barrier(
             cmd,
             image,
@@ -1319,122 +1459,50 @@ impl Renderer {
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             ),
         );
-
-        let [r, g, b, _] = frame.clear.to_linear();
-        let attachments = [vk::RenderingAttachmentInfo::default()
-            .image_view(self.swapchain.views[image_index])
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [r, g, b, 1.0],
-                },
-            })];
-        let area = vk::Rect2D {
-            offset: vk::Offset2D::default(),
-            extent,
-        };
-        self.rendering.cmd_begin_rendering(
-            cmd,
-            &vk::RenderingInfo::default()
-                .render_area(area)
-                .layer_count(1)
-                .color_attachments(&attachments),
-        );
-        device.cmd_set_viewport(
-            cmd,
-            0,
-            &[vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: extent.width as f32,
-                height: extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            }],
-        );
-        device.cmd_set_scissor(cmd, 0, &[area]);
-
-        if let Some(instances) = &self.frames[slot].instances {
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-            device.cmd_bind_vertex_buffers(cmd, 0, &[instances.buffer], &[0]);
-            for layer in layers {
-                if layer.batches.is_empty() {
-                    continue;
+        match offscreen {
+            None => {
+                self.begin_pass(cmd, self.swapchain.views[image_index], extent, Some(clear));
+                self.draw_layers(cmd, layers, slot, self.pipeline);
+                self.rendering.cmd_end_rendering(cmd);
+            }
+            Some(offscreen) => {
+                // The layers go to an image of their own first, so that a
+                // blurred copy can be made for the UI's glass. The UI is then
+                // drawn in gamma space and the result copied to the window.
+                let scene = &offscreen.scene;
+                self.to_target(cmd, scene.image, vk::ImageLayout::UNDEFINED);
+                self.begin_pass(cmd, scene.view, extent, Some(clear));
+                self.draw_layers(cmd, layers, slot, self.offscreen_pipeline);
+                self.rendering.cmd_end_rendering(cmd);
+                self.to_sampled(cmd, scene.image);
+                let glass = meshes.iter().any(|m| m.texture == BACKDROP_INDEX);
+                if glass {
+                    self.blur(cmd, offscreen);
                 }
-                device.cmd_push_constants(
+
+                let ui = &offscreen.ui;
+                self.to_target(cmd, ui.image, vk::ImageLayout::UNDEFINED);
+                self.begin_pass(cmd, ui.view, extent, None);
+                self.fullscreen(
                     cmd,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::cast_slice(&layer.clip_from_world.to_cols_array()),
+                    self.compose_pipeline,
+                    scene.set,
+                    FullscreenParams::encode(),
                 );
-                for batch in &layer.batches {
-                    let Some(texture) = self.textures[batch.texture as usize].as_ref() else {
-                        continue;
-                    };
-                    let sampler_set = self.sampler_sets[match batch.filter {
-                        Filter::Smooth => 0,
-                        Filter::Pixelated => 1,
-                    }];
-                    device.cmd_bind_descriptor_sets(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.pipeline_layout,
-                        0,
-                        &[sampler_set, texture.set],
-                        &[],
-                    );
-                    device.cmd_draw(cmd, 6, batch.count, 0, batch.first);
-                }
+                self.draw_meshes(cmd, frame, meshes, slot, glass.then_some(offscreen));
+                self.rendering.cmd_end_rendering(cmd);
+                self.to_sampled(cmd, ui.image);
+
+                self.begin_pass(cmd, self.swapchain.views[image_index], extent, None);
+                self.fullscreen(
+                    cmd,
+                    self.present_pipeline,
+                    ui.set,
+                    FullscreenParams::decode(),
+                );
+                self.rendering.cmd_end_rendering(cmd);
             }
         }
-
-        let frame_slot = &self.frames[slot];
-        if let (Some(vertices), Some(indices), false) = (
-            &frame_slot.mesh_vertices.buffer,
-            &frame_slot.mesh_indices.buffer,
-            meshes.is_empty(),
-        ) {
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.mesh_pipeline);
-            device.cmd_bind_vertex_buffers(cmd, 0, &[vertices.buffer], &[0]);
-            device.cmd_bind_index_buffer(cmd, indices.buffer, 0, vk::IndexType::UINT32);
-            device.cmd_push_constants(
-                cmd,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                bytemuck::cast_slice(&clip_from_frame(frame).to_cols_array()),
-            );
-            for mesh in meshes {
-                let Some(texture) = self.textures[mesh.texture as usize].as_ref() else {
-                    continue;
-                };
-                let sampler_set = self.sampler_sets[match mesh.filter {
-                    Filter::Smooth => 0,
-                    Filter::Pixelated => 1,
-                }];
-                device.cmd_set_scissor(cmd, 0, &[mesh.scissor]);
-                device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipeline_layout,
-                    0,
-                    &[sampler_set, texture.set],
-                    &[],
-                );
-                device.cmd_draw_indexed(
-                    cmd,
-                    mesh.index_count,
-                    1,
-                    mesh.first_index,
-                    mesh.vertex_offset,
-                    0,
-                );
-            }
-        }
-        self.rendering.cmd_end_rendering(cmd);
 
         match capture_into {
             Some(buffer) => {
@@ -1500,6 +1568,403 @@ impl Renderer {
         }
         device.end_command_buffer(cmd)
     }
+
+    /// Starts drawing into `view`, clearing it first if `clear` is given,
+    /// and sets the viewport and scissor to cover it.
+    unsafe fn begin_pass(
+        &self,
+        cmd: vk::CommandBuffer,
+        view: vk::ImageView,
+        extent: vk::Extent2D,
+        clear: Option<[f32; 4]>,
+    ) {
+        let attachments = [vk::RenderingAttachmentInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(if clear.is_some() {
+                vk::AttachmentLoadOp::CLEAR
+            } else {
+                vk::AttachmentLoadOp::DONT_CARE
+            })
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: clear.unwrap_or_default(),
+                },
+            })];
+        let area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        };
+        self.rendering.cmd_begin_rendering(
+            cmd,
+            &vk::RenderingInfo::default()
+                .render_area(area)
+                .layer_count(1)
+                .color_attachments(&attachments),
+        );
+        self.device.cmd_set_viewport(
+            cmd,
+            0,
+            &[vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }],
+        );
+        self.device.cmd_set_scissor(cmd, 0, &[area]);
+    }
+
+    /// Readies an offscreen image to be drawn into. Its old contents are
+    /// dropped unless `from` says what layout they are in.
+    unsafe fn to_target(&self, cmd: vk::CommandBuffer, image: vk::Image, from: vk::ImageLayout) {
+        // The previous frame may still be reading it.
+        self.barrier(
+            cmd,
+            image,
+            (from, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            (
+                vk::AccessFlags::SHADER_READ,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            ),
+            (
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            ),
+        );
+    }
+
+    /// Readies an offscreen image that was just drawn into to be read.
+    unsafe fn to_sampled(&self, cmd: vk::CommandBuffer, image: vk::Image) {
+        self.barrier(
+            cmd,
+            image,
+            (
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            ),
+            (
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags::SHADER_READ,
+            ),
+            (
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            ),
+        );
+    }
+
+    /// Blurs the backdrop's scene image into its first level: each step
+    /// halves the size, then each step back doubles it again.
+    unsafe fn blur(&self, cmd: vk::CommandBuffer, offscreen: &Offscreen) {
+        let mut source = &offscreen.scene;
+        for level in &offscreen.levels {
+            self.to_target(cmd, level.image, vk::ImageLayout::UNDEFINED);
+            self.begin_pass(cmd, level.view, level.extent(), None);
+            self.fullscreen(
+                cmd,
+                self.blur_pipeline,
+                source.set,
+                FullscreenParams::shrink(source),
+            );
+            self.rendering.cmd_end_rendering(cmd);
+            self.to_sampled(cmd, level.image);
+            source = level;
+        }
+        for index in (0..offscreen.levels.len().saturating_sub(1)).rev() {
+            let level = &offscreen.levels[index];
+            let source = &offscreen.levels[index + 1];
+            self.to_target(cmd, level.image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            self.begin_pass(cmd, level.view, level.extent(), None);
+            let mut params = FullscreenParams::grow(source);
+            if index == 0 {
+                params.saturation = BACKDROP_SATURATION;
+            }
+            self.fullscreen(cmd, self.blur_pipeline, source.set, params);
+            self.rendering.cmd_end_rendering(cmd);
+            self.to_sampled(cmd, level.image);
+        }
+    }
+
+    /// Covers the current pass with `source`, filtered as `params` says.
+    unsafe fn fullscreen(
+        &self,
+        cmd: vk::CommandBuffer,
+        pipeline: vk::Pipeline,
+        source: vk::DescriptorSet,
+        params: FullscreenParams,
+    ) {
+        let device = &self.device;
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.fullscreen_layout,
+            0,
+            &[self.sampler_sets[0], source],
+            &[],
+        );
+        device.cmd_push_constants(
+            cmd,
+            self.fullscreen_layout,
+            vk::ShaderStageFlags::FRAGMENT,
+            0,
+            bytemuck::bytes_of(&params),
+        );
+        device.cmd_draw(cmd, 3, 1, 0, 0);
+    }
+
+    unsafe fn draw_layers(
+        &self,
+        cmd: vk::CommandBuffer,
+        layers: &[LayerDraw],
+        slot: usize,
+        pipeline: vk::Pipeline,
+    ) {
+        let device = &self.device;
+        let Some(instances) = &self.frames[slot].instances else {
+            return;
+        };
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_bind_vertex_buffers(cmd, 0, &[instances.buffer], &[0]);
+        for layer in layers {
+            if layer.batches.is_empty() {
+                continue;
+            }
+            device.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytemuck::cast_slice(&layer.clip_from_world.to_cols_array()),
+            );
+            for batch in &layer.batches {
+                let Some(texture) = self.textures[batch.texture as usize].as_ref() else {
+                    continue;
+                };
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &[self.sampler_set(batch.filter), texture.set],
+                    &[],
+                );
+                device.cmd_draw(cmd, 6, batch.count, 0, batch.first);
+            }
+        }
+    }
+
+    unsafe fn draw_meshes(
+        &self,
+        cmd: vk::CommandBuffer,
+        frame: &Frame,
+        meshes: &[MeshDraw],
+        slot: usize,
+        backdrop: Option<&Offscreen>,
+    ) {
+        let device = &self.device;
+        let frame_slot = &self.frames[slot];
+        let (Some(vertices), Some(indices), false) = (
+            &frame_slot.mesh_vertices.buffer,
+            &frame_slot.mesh_indices.buffer,
+            meshes.is_empty(),
+        ) else {
+            return;
+        };
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.mesh_pipeline);
+        device.cmd_bind_vertex_buffers(cmd, 0, &[vertices.buffer], &[0]);
+        device.cmd_bind_index_buffer(cmd, indices.buffer, 0, vk::IndexType::UINT32);
+        device.cmd_push_constants(
+            cmd,
+            self.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            bytemuck::cast_slice(&clip_from_frame(frame).to_cols_array()),
+        );
+        for mesh in meshes {
+            let set = if mesh.texture == BACKDROP_INDEX {
+                // Without a backdrop, glass falls back to its plain tint.
+                match backdrop {
+                    Some(backdrop) => backdrop.levels[0].set,
+                    None => match self.textures[self.white.index as usize].as_ref() {
+                        Some(white) => white.set,
+                        None => continue,
+                    },
+                }
+            } else {
+                match self.textures[mesh.texture as usize].as_ref() {
+                    Some(texture) => texture.set,
+                    None => continue,
+                }
+            };
+            device.cmd_set_scissor(cmd, 0, &[mesh.scissor]);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[self.sampler_set(mesh.filter), set],
+                &[],
+            );
+            device.cmd_draw_indexed(
+                cmd,
+                mesh.index_count,
+                1,
+                mesh.first_index,
+                mesh.vertex_offset,
+                0,
+            );
+        }
+    }
+
+    fn sampler_set(&self, filter: Filter) -> vk::DescriptorSet {
+        self.sampler_sets[match filter {
+            Filter::Smooth => 0,
+            Filter::Pixelated => 1,
+        }]
+    }
+
+    // --- Backdrop ------------------------------------------------------------
+
+    /// A texture holding a blurred copy of the frame's layers, for drawing
+    /// frosted glass under user interfaces. Use it in a [`Mesh`](crate::Mesh)
+    /// with texture coordinates that map the window from `(0, 0)` to
+    /// `(1, 1)`. It costs nothing in frames that do not use it.
+    pub fn backdrop(&self) -> Texture {
+        Texture {
+            index: BACKDROP_INDEX,
+            width: self.swapchain.extent.width,
+            height: self.swapchain.extent.height,
+        }
+    }
+
+    /// Makes the offscreen images if they are missing or the wrong size.
+    unsafe fn ensure_offscreen(&mut self) -> Result<(), RenderError> {
+        let extent = self.swapchain.extent;
+        if self.offscreen.as_ref().is_some_and(|o| o.extent == extent) {
+            return Ok(());
+        }
+        if let Some(old) = self.offscreen.take() {
+            self.device
+                .device_wait_idle()
+                .map_err(vk_err("waiting for the device"))?;
+            self.destroy_offscreen(old);
+        }
+        while self.offscreen_sets.len() < BLUR_LEVELS + 2 {
+            let set = self.allocate_set(self.texture_layout)?;
+            self.offscreen_sets.push(set);
+        }
+        let sets = self.offscreen_sets.clone();
+        let (width, height) = (extent.width, extent.height);
+        let scene = self.create_target(width, height, OFFSCREEN_FORMAT, sets[0])?;
+        let ui = self.create_target(width, height, UI_FORMAT, sets[1])?;
+        let mut levels = Vec::new();
+        for level in 0..BLUR_LEVELS {
+            let shift = level as u32 + 1;
+            let target = self.create_target(
+                (width >> shift).max(1),
+                (height >> shift).max(1),
+                OFFSCREEN_FORMAT,
+                sets[level + 2],
+            )?;
+            levels.push(target);
+        }
+        self.offscreen = Some(Offscreen {
+            scene,
+            ui,
+            levels,
+            extent,
+        });
+        Ok(())
+    }
+
+    unsafe fn create_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        set: vk::DescriptorSet,
+    ) -> Result<Target, RenderError> {
+        let image = self
+            .device
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(format)
+                    .extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )
+            .map_err(vk_err("creating an offscreen image"))?;
+        let allocation = self
+            .allocator
+            .allocate(&AllocationCreateDesc {
+                name: "offscreen",
+                requirements: self.device.get_image_memory_requirements(image),
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })
+            .map_err(|e| RenderError::Memory(e.to_string()))?;
+        self.device
+            .bind_image_memory(image, allocation.memory(), allocation.offset())
+            .map_err(vk_err("binding offscreen memory"))?;
+        let view = self
+            .device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(color_range()),
+                None,
+            )
+            .map_err(vk_err("creating an offscreen view"))?;
+        let info = [vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        self.device.update_descriptor_sets(
+            &[vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&info)],
+            &[],
+        );
+        Ok(Target {
+            image,
+            view,
+            allocation,
+            set,
+            width,
+            height,
+        })
+    }
+
+    /// Frees the offscreen images. The device must be idle.
+    unsafe fn destroy_offscreen(&mut self, offscreen: Offscreen) {
+        let targets = [offscreen.scene, offscreen.ui]
+            .into_iter()
+            .chain(offscreen.levels);
+        for target in targets {
+            self.device.destroy_image_view(target.view, None);
+            self.device.destroy_image(target.image, None);
+            let _ = self.allocator.free(target.allocation);
+        }
+    }
 }
 
 impl Drop for Renderer {
@@ -1508,6 +1973,9 @@ impl Drop for Renderer {
             let _ = self.device.device_wait_idle();
             for texture in std::mem::take(&mut self.textures).into_iter().flatten() {
                 self.free_texture(texture);
+            }
+            if let Some(offscreen) = self.offscreen.take() {
+                self.destroy_offscreen(offscreen);
             }
             for slot in std::mem::take(&mut self.frames) {
                 for buffer in [
@@ -1531,8 +1999,18 @@ impl Drop for Renderer {
             }
             self.device.destroy_pipeline(self.mesh_pipeline, None);
             self.device.destroy_pipeline(self.pipeline, None);
+            for pipeline in [
+                self.offscreen_pipeline,
+                self.blur_pipeline,
+                self.compose_pipeline,
+                self.present_pipeline,
+            ] {
+                self.device.destroy_pipeline(pipeline, None);
+            }
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_pipeline_layout(self.fullscreen_layout, None);
             self.device
                 .destroy_descriptor_set_layout(self.sampler_layout, None);
             self.device
@@ -1806,10 +2284,13 @@ unsafe fn create_quad_pipeline(
         layout,
         color_format,
         QUAD_WGSL,
-        vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(std::mem::size_of::<Instance>() as u32)
-            .input_rate(vk::VertexInputRate::INSTANCE),
+        true,
+        Some(
+            vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(std::mem::size_of::<Instance>() as u32)
+                .input_rate(vk::VertexInputRate::INSTANCE),
+        ),
         &[
             attribute(0, vk::Format::R32G32B32A32_SFLOAT, 0),
             attribute(1, vk::Format::R32G32_SFLOAT, 16),
@@ -1837,10 +2318,13 @@ unsafe fn create_mesh_pipeline(
         layout,
         color_format,
         MESH_WGSL,
-        vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(std::mem::size_of::<MeshVertex>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX),
+        true,
+        Some(
+            vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(std::mem::size_of::<MeshVertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX),
+        ),
         &[
             attribute(0, vk::Format::R32G32_SFLOAT, 0),
             attribute(1, vk::Format::R32G32_SFLOAT, 8),
@@ -1849,12 +2333,30 @@ unsafe fn create_mesh_pipeline(
     )
 }
 
+/// The pipeline for full-window passes: blurring and copying the backdrop.
+unsafe fn create_fullscreen_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    color_format: vk::Format,
+) -> Result<vk::Pipeline, RenderError> {
+    create_pipeline(
+        device,
+        layout,
+        color_format,
+        FULLSCREEN_WGSL,
+        false,
+        None,
+        &[],
+    )
+}
+
 unsafe fn create_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
     color_format: vk::Format,
     shader: &str,
-    binding: vk::VertexInputBindingDescription,
+    blend: bool,
+    binding: Option<vk::VertexInputBindingDescription>,
     attributes: &[vk::VertexInputAttributeDescription],
 ) -> Result<vk::Pipeline, RenderError> {
     let spirv = compile_wgsl(shader)?;
@@ -1871,7 +2373,7 @@ unsafe fn create_pipeline(
             .module(module)
             .name(c"fs_main"),
     ];
-    let bindings = [binding];
+    let bindings: Vec<_> = binding.into_iter().collect();
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)
         .vertex_attribute_descriptions(attributes);
@@ -1887,9 +2389,9 @@ unsafe fn create_pipeline(
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    // Premultiplied alpha blending.
+    // Premultiplied alpha blending, or none: the pass replaces what was there.
     let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(true)
+        .blend_enable(blend)
         .src_color_blend_factor(vk::BlendFactor::ONE)
         .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
         .color_blend_op(vk::BlendOp::ADD)

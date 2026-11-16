@@ -156,4 +156,4 @@ So far the engine has only been run on Linux, with Mesa's software Vulkan driver
 
 ## License
 
-GPL-3.0. The built-in font is Inter, under the SIL Open Font License (see `crates/brandon_render/assets/Inter-LICENSE.txt`).
+GPL-3.0. The built-in font is Inter, under the SIL Open Font License (see `crates/brandon_render/assets/Inter-LICENSE.txt`). The editor also uses Inter SemiBold, under the same license (see `crates/brandon_editor/assets/Inter-LICENSE.txt`).

@@ -93,6 +93,78 @@ fn line(
     }
 }
 
+/// A soft, dark wallpaper with a few coloured glows, so the glass panels
+/// over it pick up some colour. Straight-alpha sRGB pixels.
+pub fn wallpaper_image(width: u32, height: u32) -> Vec<u8> {
+    fn to_linear(c: u8) -> f32 {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    fn to_srgb(c: f32) -> u8 {
+        let c = c.clamp(0.0, 1.0);
+        let s = if c <= 0.0031308 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (s * 255.0).round() as u8
+    }
+    let base = [0x0b, 0x0d, 0x12].map(to_linear);
+    // (x, y, colour, strength, reach), in parts of the window.
+    let glows: [(f32, f32, [u8; 3], f32, f32); 4] = [
+        (0.12, 0.08, [0x4a, 0x4c, 0xd6], 0.24, 0.55),
+        (0.92, 0.90, [0x14, 0x8a, 0x9c], 0.17, 0.55),
+        (0.80, 0.12, [0x8a, 0x3c, 0xc0], 0.15, 0.42),
+        (0.28, 0.98, [0x1f, 0x52, 0xb8], 0.15, 0.45),
+    ];
+    let aspect = width as f32 / height.max(1) as f32;
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let u = (x as f32 + 0.5) / width as f32;
+            let v = (y as f32 + 0.5) / height as f32;
+            let mut color = base;
+            for (gx, gy, tint, strength, reach) in glows {
+                let dx = (u - gx) * aspect;
+                let dy = v - gy;
+                let falloff = (-(dx * dx + dy * dy) / (reach * reach)).exp() * strength;
+                let tint = tint.map(to_linear);
+                for i in 0..3 {
+                    color[i] += tint[i] * falloff;
+                }
+            }
+            pixels.extend_from_slice(&[
+                to_srgb(color[0]),
+                to_srgb(color[1]),
+                to_srgb(color[2]),
+                255,
+            ]);
+        }
+    }
+    pixels
+}
+
+/// The wallpaper, stretched over the whole window.
+pub fn wallpaper_layer(texture: brandon_render::Texture, size: Vec2) -> Layer {
+    Layer {
+        view: Affine2::IDENTITY,
+        quads: vec![Quad {
+            origin: Vec2::ZERO,
+            x_axis: Vec2::new(size.x, 0.0),
+            y_axis: Vec2::new(0.0, size.y),
+            uv: [0.0, 0.0, 1.0, 1.0],
+            color: Color::WHITE,
+            texture,
+            filter: Filter::Smooth,
+            z: 0,
+        }],
+    }
+}
+
 /// The grid behind the scene, the world axes, and the outline of the game's
 /// screen. Lines are one screen pixel thick at any zoom.
 pub fn grid_layer(
@@ -117,8 +189,17 @@ pub fn grid_layer(
     while step * camera.zoom > 80.0 && step > 1.0 {
         step /= 2.0;
     }
-    let minor = Color::rgba(1.0, 1.0, 1.0, 0.010);
-    let major = Color::rgba(1.0, 1.0, 1.0, 0.028);
+    // The game's screen, as a darker sheet on the wallpaper.
+    quads.push(line(
+        Vec2::ZERO,
+        Vec2::new(screen.x, 0.0),
+        Vec2::new(0.0, screen.y),
+        Color::rgba(0.0, 0.0, 0.0, 0.55),
+        white,
+    ));
+
+    let minor = Color::rgba(1.0, 1.0, 1.0, 0.008);
+    let major = Color::rgba(1.0, 1.0, 1.0, 0.022);
     let height = bottom_right.y - top_left.y;
     let width = bottom_right.x - top_left.x;
     let first = (top_left.x / step).floor() as i64;
@@ -149,7 +230,7 @@ pub fn grid_layer(
     }
 
     // The game's screen: where (0, 0) to the window size ends up without a camera.
-    let edge = Color::rgba(0.36, 0.55, 1.0, 0.55);
+    let edge = Color::rgba(1.0, 1.0, 1.0, 0.16);
     let t = thickness * 1.5;
     quads.push(line(
         Vec2::new(0.0, -t * 0.5),
@@ -345,6 +426,8 @@ pub fn handles(world: Affine2, bounds: Option<(Vec2, Vec2)>, view: Affine2) -> H
 
 pub fn paint_handles(painter: &egui::Painter, handles: &Handles, placed: bool) {
     let color = if placed { theme::PLACED } else { theme::ACCENT };
+    let shadow = egui::Color32::from_black_alpha(70);
+    let ring = Stroke::new(2.0, egui::Color32::WHITE);
     if let Some(corners) = handles.outline {
         let mut points = corners.to_vec();
         points.push(corners[0]);
@@ -352,23 +435,29 @@ pub fn paint_handles(painter: &egui::Painter, handles: &Handles, placed: bool) {
     }
     painter.line_segment(
         [handles.origin, handles.rotate],
-        Stroke::new(1.0, theme::ROTATE.gamma_multiply(0.7)),
+        Stroke::new(1.5, egui::Color32::from_white_alpha(150)),
     );
+    painter.circle_filled(
+        handles.rotate + egui::vec2(0.0, 1.5),
+        HANDLE_RADIUS + 1.0,
+        shadow,
+    );
+    painter.circle(handles.rotate, HANDLE_RADIUS - 0.5, theme::ROTATE, ring);
+    let half = egui::Vec2::splat(HANDLE_RADIUS - 1.0);
+    let square = Rect::from_center_size(handles.scale, half * 2.0);
+    painter.rect_filled(
+        square.translate(egui::vec2(0.0, 1.5)).expand(1.5),
+        4.0,
+        shadow,
+    );
+    painter.rect(square, 3.0, theme::SCALE, ring, egui::StrokeKind::Outside);
+    painter.circle_filled(handles.origin + egui::vec2(0.0, 1.0), 5.5, shadow);
     painter.circle(
-        handles.rotate,
-        HANDLE_RADIUS - 1.0,
-        theme::ROTATE,
-        Stroke::new(1.5, theme::BG),
+        handles.origin,
+        4.0,
+        egui::Color32::WHITE,
+        Stroke::new(2.0, color),
     );
-    let half = egui::Vec2::splat(HANDLE_RADIUS - 1.5);
-    painter.rect(
-        Rect::from_center_size(handles.scale, half * 2.0),
-        2.0,
-        theme::SCALE,
-        Stroke::new(1.5, theme::BG),
-        egui::StrokeKind::Outside,
-    );
-    painter.circle(handles.origin, 3.5, color, Stroke::new(1.5, theme::BG));
 }
 
 /// What a drag in the viewport is doing.

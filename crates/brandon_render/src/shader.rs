@@ -1,6 +1,6 @@
 use crate::RenderError;
 
-/// The one shader the renderer uses for now: instanced, textured quads.
+/// The shader for instanced, textured quads: sprites and text.
 pub(crate) const QUAD_WGSL: &str = r#"
 struct Globals {
     clip_from_world: mat4x4<f32>,
@@ -46,8 +46,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 /// The shader for UI meshes. Vertex colours and textures are premultiplied
-/// sRGB, and colours are multiplied in gamma space, which is what UI
-/// toolkits such as egui expect.
+/// sRGB. It draws into a gamma-space image, so colours are multiplied and
+/// blended in gamma space, which is what UI toolkits such as egui expect.
 pub(crate) const MESH_WGSL: &str = r#"
 struct Globals {
     clip_from_world: mat4x4<f32>,
@@ -82,6 +82,58 @@ fn gamma_from_linear(linear: vec3<f32>) -> vec3<f32> {
     return select(high, low, linear < vec3<f32>(0.0031308));
 }
 
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // sRGB textures are read as linear values; turn them back into gamma.
+    let texel = textureSample(mesh_texture, mesh_sampler, in.uv);
+    return in.color * vec4<f32>(gamma_from_linear(texel.rgb), texel.a);
+}
+"#;
+
+/// Full-window passes for the backdrop: shrinking and growing the image to
+/// blur it (the "dual Kawase" filter), and copying it to the window.
+pub(crate) const FULLSCREEN_WGSL: &str = r#"
+struct Params {
+    // One texel of the image being read, in texture coordinates.
+    texel: vec2<f32>,
+    // How far apart the samples are, in texels.
+    spread: f32,
+    // 0 shrinks, 1 grows, 2 copies, 3 copies from linear to gamma, 4 copies
+    // from gamma to linear.
+    mode: u32,
+    // 1.0 leaves colours as they are; more makes them more vivid.
+    saturation: f32,
+}
+var<push_constant> params: Params;
+
+struct VsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    // One triangle that covers the whole target.
+    let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
+    var out: VsOut;
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@group(0) @binding(0) var source_sampler: sampler;
+@group(1) @binding(0) var source: texture_2d<f32>;
+
+fn at(uv: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(source, source_sampler, uv, 0.0);
+}
+
+fn gamma_from_linear(linear: vec3<f32>) -> vec3<f32> {
+    let low = linear * 12.92;
+    let high = 1.055 * pow(linear, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
+    return select(high, low, linear < vec3<f32>(0.0031308));
+}
+
 fn linear_from_gamma(gamma: vec3<f32>) -> vec3<f32> {
     let low = gamma / 12.92;
     let high = pow((gamma + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
@@ -90,9 +142,40 @@ fn linear_from_gamma(gamma: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let texel = textureSample(mesh_texture, mesh_sampler, in.uv);
-    let gamma = in.color * vec4<f32>(gamma_from_linear(texel.rgb), texel.a);
-    return vec4<f32>(linear_from_gamma(gamma.rgb), gamma.a);
+    if params.mode == 3u {
+        let c = at(in.uv);
+        return vec4<f32>(gamma_from_linear(max(c.rgb, vec3<f32>(0.0))), 1.0);
+    }
+    if params.mode == 4u {
+        let c = at(in.uv);
+        return vec4<f32>(linear_from_gamma(c.rgb), 1.0);
+    }
+    let o = params.texel * params.spread;
+    let uv = in.uv;
+    var color: vec4<f32>;
+    if params.mode == 0u {
+        color = at(uv) * 4.0
+            + at(uv - o)
+            + at(uv + o)
+            + at(uv + vec2<f32>(o.x, -o.y))
+            + at(uv - vec2<f32>(o.x, -o.y));
+        color = color / 8.0;
+    } else if params.mode == 1u {
+        color = at(uv + vec2<f32>(-o.x * 2.0, 0.0))
+            + at(uv + vec2<f32>(-o.x, o.y)) * 2.0
+            + at(uv + vec2<f32>(0.0, o.y * 2.0))
+            + at(uv + vec2<f32>(o.x, o.y)) * 2.0
+            + at(uv + vec2<f32>(o.x * 2.0, 0.0))
+            + at(uv + vec2<f32>(o.x, -o.y)) * 2.0
+            + at(uv + vec2<f32>(0.0, -o.y * 2.0))
+            + at(uv + vec2<f32>(-o.x, -o.y)) * 2.0;
+        color = color / 12.0;
+    } else {
+        color = at(uv);
+    }
+    let luma = dot(color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let vivid = mix(vec3<f32>(luma), color.rgb, params.saturation);
+    return vec4<f32>(max(vivid, vec3<f32>(0.0)), color.a);
 }
 "#;
 
@@ -128,6 +211,11 @@ mod tests {
     #[test]
     fn mesh_shader_compiles() {
         compile_wgsl(MESH_WGSL).unwrap();
+    }
+
+    #[test]
+    fn fullscreen_shader_compiles() {
+        compile_wgsl(FULLSCREEN_WGSL).unwrap();
     }
 
     #[test]
